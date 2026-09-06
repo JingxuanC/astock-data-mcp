@@ -1,0 +1,41 @@
+services:
+  astock-data-mcp:
+    build: .
+    image: astock-data-mcp:latest
+    container_name: astock-data-mcp
+    ports:
+      - "50052:50052"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # HOST: 0.0.0.0                 # 监听地址（默认 0.0.0.0）
+      # PORT: "50052"
+      # license 鉴权（可选）：设置后强制 X-License-Key
+      # MCP_LICENSE_FILE: /app/licenses/licenses.json
+      # MCP_WORKERS: "2"              # 异步任务 worker 数（默认 2）
+      # MCP_QUEUE_SIZE: "50"
+      # MCP_USAGE_DIR: /app/usage
+      DATA_CACHE_DIR: /app/.data_cache
+      # DATA_CACHE_TTL: "300"
+    volumes:
+      - ./.data_cache:/app/.data_cache                       # 工具结果缓存持久化
+      # - ./licenses.json:/app/licenses/licenses.json:ro     # license key 文件
+    restart: unless-stopped
+
+  # ── 分域模式示例（六域独立进程，故障隔离；取消注释即用）──
+  # astock-market:
+  #   build: .
+  #   image: astock-data-mcp:latest
+  #   container_name: astock-market
+  #   command: ["python3", "mcp_domain_server.py", "--domain", "market", "--host", "0.0.0.0", "--port", "50056"]
+  #   ports:
+  #     - "50056:50056"
+  #   restart: unless-stopped
+  #
+  # astock-sentiment:
+  #   build: .
+  #   image: astock-data-mcp:latest
+  #   container_name: astock-sentiment
+  #   command: ["python3", "mcp_domain_server.py", "--domain", "sentiment", "--host", "0.0.0.0", "--port", "50055"]
+  #   ports:
+  #     - "50055:50055"
+  #   restart: unless-stopped

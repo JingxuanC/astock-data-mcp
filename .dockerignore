@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.git/
+.github/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+logs/
+data/
+*.h5
+.data_cache/
+.env
+Dockerfile
+docker-compose.yml
+.dockerignore

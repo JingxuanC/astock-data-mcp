@@ -110,6 +110,40 @@ python3 mcp_domain_server.py --domain options   --port 50059
 
 每个域独立进程/端口，只暴露本域工具；额外端点：`GET /quota`、`GET /queue-stats`、`GET /jobs/<id>`（异步任务，见下）。
 
+## Docker 部署
+
+无需本地 Python 环境，一条命令起服务（默认整跑模式，45 个工具）：
+
+```bash
+docker compose up -d        # 构建镜像 + 启动容器（首次构建约 1-3 分钟）
+docker compose ps           # 查看状态
+docker compose logs -f      # 跟踪日志
+```
+
+验证：
+
+```bash
+curl http://127.0.0.1:50052/health
+curl http://127.0.0.1:50052/tools   # 应返回 45 个工具
+curl -X POST http://127.0.0.1:50052/call-tool \
+  -H 'Content-Type: application/json' \
+  -d '{"tool": "get_a_realtime", "arguments": {"symbol": "sh600519"}}'
+```
+
+分域模式：`docker-compose.yml` 里附了 market / sentiment 两个域的注释示例，
+取消注释后 `docker compose up -d` 即整跑 + 分域并存（其余四域照抄改
+`--domain` 和端口即可）。
+
+license 鉴权（可选）：在 `docker-compose.yml` 中取消注释，把宿主机
+`licenses.json` 挂进容器并设置 `MCP_LICENSE_FILE`：
+
+```yaml
+environment:
+  MCP_LICENSE_FILE: /app/licenses/licenses.json
+volumes:
+  - ./licenses.json:/app/licenses/licenses.json:ro
+```
+
 ## MCP 客户端接入
 
 分域服务是 Streamable HTTP MCP（JSON-RPC over POST）。以 market 域为例：
