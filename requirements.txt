@@ -1,0 +1,10 @@
+requests>=2.31
+pandas>=2.0
+numpy>=1.26,<2
+# pandas.read_html 解析同花顺页面 (get_a_eps_forecast)
+lxml>=4.9
+# 通达信行情/财务直连 (get_a_mootdx_finance / get_a_mootdx_f10)
+mootdx>=0.11
+
+# ── 开发 ──
+# pytest>=8.0   # test_mcp_gateway.py

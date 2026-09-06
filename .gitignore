@@ -1,0 +1,17 @@
+# Byte-compiled / cache
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# 数据与运行产物
+.data_cache/
+reports/
+*.log
+.usage-*.json
+mcp-licenses/
+
+# 环境
+.env
+.venv/
+venv/
