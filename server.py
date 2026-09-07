@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from research_report import fetch_research_reports
+from mcp_gateway import LicenseStore, QuotaExceeded
 
 # ── Lazy imports for A-share extensions ──
 _requests = None
@@ -1887,15 +1888,37 @@ VERSION = "1.0.0"
 class DataHandler(BaseHTTPRequestHandler):
     """HTTP handler: /health /tools /call-tool /mcp (MCP JSON-RPC)."""
 
+    license_store: "LicenseStore | None" = None
+
     def log_message(self, format, *args):
         logger.debug("HTTP %s", format % args)
 
+    def _license_key(self) -> str:
+        return self.headers.get("X-License-Key", "")
+
+    def _check_license(self) -> tuple:
+        """返回 (ok, message)。开放模式或未启用一律放行。"""
+        store = self.license_store
+        if store and store.enabled:
+            return store.check(self._license_key())
+        return True, ""
+
     def do_GET(self):
         if self.path == "/health":
-            self._json(200, {"status": "ok", "version": VERSION, "tools": len(TOOLS)})
+            self._json(200, {"status": "ok", "version": VERSION, "tools": len(TOOLS),
+                             "auth": bool(self.license_store and self.license_store.enabled)})
         elif self.path == "/tools":
             # Return all registered tools for MCP Registry hot-plug
             self._json(200, {"tools": [t.to_dict() for t in TOOLS.values()]})
+        elif self.path == "/quota":
+            if not (self.license_store and self.license_store.enabled):
+                self._json(200, {"auth": "open", "note": "开放模式，无额度限制"})
+                return
+            ok, info = self._check_license()
+            if not ok:
+                self._json(401, {"error": info})
+                return
+            self._json(200, self.license_store.quota_of(self._license_key()))
         else:
             self._json(404, {"error": "not found"})
 
@@ -1909,6 +1932,10 @@ class DataHandler(BaseHTTPRequestHandler):
                 return
 
             if self.path == "/call-tool":
+                ok, info = self._check_license()
+                if not ok:
+                    self._json(401, {"error": info})
+                    return
                 tool_name = data.get("tool", "")
                 tool_args = data.get("arguments", {})
                 if tool_name not in HANDLERS:
@@ -1960,10 +1987,25 @@ class DataHandler(BaseHTTPRequestHandler):
         if method == "tools/call":
             tool_name = params.get("name", "")
             tool_args = params.get("arguments", {})
+            # 鉴权：license 模式强制校验 key（initialize/tools/list 保持开放便于发现）
+            ok, info = self._check_license()
+            if not ok:
+                self._json(200, {"jsonrpc": "2.0", "id": mid,
+                                 "error": {"code": -32001, "message": info}})
+                return
             if tool_name not in HANDLERS:
                 self._json(200, {"jsonrpc": "2.0", "id": mid,
                                  "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}})
                 return
+            # 额度：先扣再跑（失败不退还——成本已发生）
+            store = self.license_store
+            if store and store.enabled:
+                try:
+                    store.consume(self._license_key(), heavy=False)
+                except QuotaExceeded as e:
+                    self._json(200, {"jsonrpc": "2.0", "id": mid,
+                                     "error": {"code": -32029, "message": str(e)}})
+                    return
             try:
                 result = HANDLERS[tool_name](**tool_args)
                 self._json(200, {"jsonrpc": "2.0", "id": mid, "result": {
@@ -1995,9 +2037,12 @@ class DataHandler(BaseHTTPRequestHandler):
 # Server launcher
 # ═══════════════════════════════════════════════
 
-def serve_http(host: str = "0.0.0.0", port: int = 50052) -> None:
+def serve_http(host: str = "0.0.0.0", port: int = 50052, license_file: str = "") -> None:
+    DataHandler.license_store = LicenseStore(license_file, domain="astock")
     server = ThreadingHTTPServer((host, port), DataHandler)
-    logger.warning("astock-data-mcp listening on %s:%d (HTTP, tools=%d)", host, port, len(TOOLS))
+    logger.warning("astock-data-mcp listening on %s:%d (HTTP, tools=%d, auth=%s)",
+                   host, port, len(TOOLS),
+                   "on" if DataHandler.license_store.enabled else "open")
     server.serve_forever()
 
 
@@ -2006,5 +2051,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="astock-data-mcp: A股全维数据 HTTP/MCP 服务")
     ap.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
     ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", "50052")))
+    ap.add_argument("--license-file", default=os.environ.get("MCP_LICENSE_FILE", ""),
+                    help="license key JSON 路径（env MCP_LICENSE_FILE）；不配置=开放模式")
     args = ap.parse_args()
-    serve_http(args.host, args.port)
+    serve_http(args.host, args.port, args.license_file)
