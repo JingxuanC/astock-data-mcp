@@ -1,5 +1,8 @@
 FROM python:3.11-slim
 
+# 国内构建加速：--build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+ARG PIP_INDEX_URL
+
 # mootdx（通达信直连）在 slim 镜像上可纯 wheel 安装，无需编译工具链；
 # 若未来依赖需要编译，取消下一行注释：
 # RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
