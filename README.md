@@ -191,6 +191,28 @@ python3 mcp_domain_server.py --domain market --port 50056
 pytest test_mcp_gateway.py   # license/额度/队列单测（离线）
 ```
 
+## 可观察性 / Observability
+
+整跑与分域服务均暴露 `GET /metrics`（Prometheus 文本格式，**无鉴权**，只含工具名级聚合，不泄露 license key）：
+
+| 指标 | 类型 | 说明 |
+|------|------|------|
+| `mcp_tool_calls_total{tool,status}` | counter | 调用次数；status ∈ `ok` / `error` / `rejected_license` / `rejected_quota` / `queued` |
+| `mcp_tool_latency_seconds_sum{tool}` / `mcp_tool_latency_seconds_count{tool}` | counter | 延迟累计/次数，平均延迟 = sum / count |
+| `mcp_queue_depth` | gauge | 当前排队任务数（分域服务，含 JobQueue 时） |
+| `mcp_queue_jobs_total{status}` | counter | 异步任务完成数（`done` / `error`，分域服务） |
+| `mcp_uptime_seconds` | gauge | 进程启动至今秒数 |
+
+Prometheus scrape 配置示例：
+
+```yaml
+scrape_configs:
+  - job_name: astock-data-mcp
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:50052"]   # 整跑；分域模式换成各域端口 50054-50059
+```
+
 ## 致谢
 
 抽取自 **Athena** — local-first、AI-native 的多 Agent 量化交易系统（5 LLM Agent 管线协作）。本仓为其 py-sidecar 数据层的 A 股子集。

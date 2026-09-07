@@ -19,6 +19,7 @@
     GET  /jobs/<id>     异步任务状态/结果（重负载工具走队列，见 ASYNC_TOOLS）
     GET  /quota         当前 license key 的额度余量（鉴权模式）
     GET  /queue-stats   队列概况
+    GET  /metrics       Prometheus 指标（无鉴权）
 
 鉴权与额度（mcp_gateway.py）：
     环境变量 MCP_LICENSE_FILE 指向 license JSON 时强制鉴权
@@ -32,12 +33,13 @@ import argparse
 import json
 import logging
 import os
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # 复用 sidecar 的工具注册表（HANDLERS: name→callable, TOOLS: name→ToolDef）
 from server import HANDLERS, TOOLS  # noqa: F401  — 副作用：注册全部工具
 
-from mcp_gateway import JobQueue, LicenseStore, QueueFull, QuotaExceeded
+from mcp_gateway import METRICS, JobQueue, LicenseStore, QueueFull, QuotaExceeded
 
 logger = logging.getLogger("domain-mcp")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -125,6 +127,15 @@ class DomainHandler(BaseHTTPRequestHandler):
                              "auth": bool(self.license_store and self.license_store.enabled)})
         elif self.path == "/tools":
             self._send(200, {"tools": self._tool_schemas()})
+        elif self.path == "/metrics":
+            # Prometheus 抓取端点：不要求鉴权（只含工具名级聚合，不泄露 key）
+            depth = self.job_queue.stats()["queue_size"] if self.job_queue else None
+            body = METRICS.render(queue_depth=depth).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         elif self.path == "/quota":
             if not (self.license_store and self.license_store.enabled):
                 self._send(200, {"mode": "open"})
@@ -199,6 +210,7 @@ class DomainHandler(BaseHTTPRequestHandler):
             if store and store.enabled:
                 ok, info = store.check(key)
                 if not ok:
+                    METRICS.inc_call(tool_name, "rejected_license")
                     self._send(200, {"jsonrpc": "2.0", "id": mid,
                                      "error": {"code": -32001, "message": info}})
                     return
@@ -212,6 +224,7 @@ class DomainHandler(BaseHTTPRequestHandler):
                 try:
                     store.consume(key, heavy=bool(is_async))
                 except QuotaExceeded as e:
+                    METRICS.inc_call(tool_name, "rejected_quota")
                     self._send(200, {"jsonrpc": "2.0", "id": mid,
                                      "error": {"code": -32029, "message": str(e)}})
                     return
@@ -223,6 +236,8 @@ class DomainHandler(BaseHTTPRequestHandler):
                     self._send(200, {"jsonrpc": "2.0", "id": mid,
                                      "error": {"code": -32029, "message": str(e)}})
                     return
+                # 入队成功记 queued；执行结果（ok/error + latency）由 worker 完成时记
+                METRICS.inc_call(tool_name, "queued")
                 self._send(200, {"jsonrpc": "2.0", "id": mid, "result": {
                     "content": [{"type": "text", "text": json.dumps({
                         "job_id": job_id, "status": "queued",
@@ -230,14 +245,19 @@ class DomainHandler(BaseHTTPRequestHandler):
                         "note": "重任务已入队，轮询 GET /jobs/<id> 拿结果",
                     }, ensure_ascii=False)}], "isError": False}})
                 return
+            t0 = time.time()
             try:
                 result = HANDLERS[tool_name](**tool_args)
+                METRICS.inc_call(tool_name, "ok")
                 self._send(200, {"jsonrpc": "2.0", "id": mid, "result": {
                     "content": [{"type": "text", "text": str(result)}], "isError": False}})
             except Exception as e:  # noqa: BLE001
+                METRICS.inc_call(tool_name, "error")
                 logger.error("tool call error %s: %s", tool_name, e)
                 self._send(200, {"jsonrpc": "2.0", "id": mid, "result": {
                     "content": [{"type": "text", "text": f"Error: {e}"}], "isError": True}})
+            finally:
+                METRICS.observe_latency(tool_name, time.time() - t0)
             return
 
         self._send(200, {"jsonrpc": "2.0", "id": mid,

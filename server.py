@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from research_report import fetch_research_reports
-from mcp_gateway import LicenseStore, QuotaExceeded
+from mcp_gateway import METRICS, LicenseStore, QuotaExceeded
 
 # ── Lazy imports for A-share extensions ──
 _requests = None
@@ -1910,6 +1910,14 @@ class DataHandler(BaseHTTPRequestHandler):
         elif self.path == "/tools":
             # Return all registered tools for MCP Registry hot-plug
             self._json(200, {"tools": [t.to_dict() for t in TOOLS.values()]})
+        elif self.path == "/metrics":
+            # Prometheus 抓取端点：不要求鉴权（只含工具名级聚合，不泄露 key）
+            body = METRICS.render().encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         elif self.path == "/quota":
             if not (self.license_store and self.license_store.enabled):
                 self._json(200, {"auth": "open", "note": "开放模式，无额度限制"})
@@ -1934,6 +1942,8 @@ class DataHandler(BaseHTTPRequestHandler):
             if self.path == "/call-tool":
                 ok, info = self._check_license()
                 if not ok:
+                    tool_name = data.get("tool", "")
+                    METRICS.inc_call(tool_name, "rejected_license")
                     self._json(401, {"error": info})
                     return
                 tool_name = data.get("tool", "")
@@ -1941,7 +1951,15 @@ class DataHandler(BaseHTTPRequestHandler):
                 if tool_name not in HANDLERS:
                     self._json(404, {"error": f"unknown tool: {tool_name}"})
                     return
-                result = HANDLERS[tool_name](**tool_args)
+                t0 = time.time()
+                try:
+                    result = HANDLERS[tool_name](**tool_args)
+                except Exception:
+                    METRICS.inc_call(tool_name, "error")
+                    METRICS.observe_latency(tool_name, time.time() - t0)
+                    raise
+                METRICS.inc_call(tool_name, "ok")
+                METRICS.observe_latency(tool_name, time.time() - t0)
                 self._json(200, {"result": result})
             else:
                 self._json(404, {"error": "not found"})
@@ -1990,6 +2008,7 @@ class DataHandler(BaseHTTPRequestHandler):
             # 鉴权：license 模式强制校验 key（initialize/tools/list 保持开放便于发现）
             ok, info = self._check_license()
             if not ok:
+                METRICS.inc_call(tool_name, "rejected_license")
                 self._json(200, {"jsonrpc": "2.0", "id": mid,
                                  "error": {"code": -32001, "message": info}})
                 return
@@ -2003,20 +2022,26 @@ class DataHandler(BaseHTTPRequestHandler):
                 try:
                     store.consume(self._license_key(), heavy=False)
                 except QuotaExceeded as e:
+                    METRICS.inc_call(tool_name, "rejected_quota")
                     self._json(200, {"jsonrpc": "2.0", "id": mid,
                                      "error": {"code": -32029, "message": str(e)}})
                     return
+            t0 = time.time()
             try:
                 result = HANDLERS[tool_name](**tool_args)
+                METRICS.inc_call(tool_name, "ok")
                 self._json(200, {"jsonrpc": "2.0", "id": mid, "result": {
                     "content": [{"type": "text", "text": str(result)}],
                     "isError": False,
                 }})
             except Exception as e:
+                METRICS.inc_call(tool_name, "error")
                 self._json(200, {"jsonrpc": "2.0", "id": mid, "result": {
                     "content": [{"type": "text", "text": f"Error: {e}"}],
                     "isError": True,
                 }})
+            finally:
+                METRICS.observe_latency(tool_name, time.time() - t0)
             return
 
         self._json(200, {"jsonrpc": "2.0", "id": mid,
