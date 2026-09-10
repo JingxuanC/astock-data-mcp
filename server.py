@@ -194,8 +194,10 @@ def _cache_get(tool_name: str, *args) -> Optional[Any]:
 
 def _cache_set(tool_name: str, value: Any, *args) -> None:
     p = _cache_path(tool_name, *args)
+    tmp = p.with_suffix(".tmp")
     try:
-        p.write_text(json.dumps({"ts": time.time(), "value": value}))
+        tmp.write_text(json.dumps({"ts": time.time(), "value": value}))
+        tmp.replace(p)  # 原子换名，读者不会看到写了一半的文件
     except OSError:
         pass
 
@@ -632,19 +634,25 @@ def get_a_industry_reports(industry_code: str = "*", max_pages: int = 3) -> str:
         return '{"error":"%s"}' % str(e)
 
 
-@tool("download_report_pdf", "Download a research report PDF by infoCode. Returns saved file path.",
+REPORTS_DIR = Path(os.environ.get("REPORTS_DIR", str(CACHE_DIR.parent / "reports")))
+
+
+@tool("download_report_pdf", "Download a research report PDF by infoCode. Returns saved file path. "
+      "Files are saved under a fixed server-side reports dir (REPORTS_DIR env).",
       {"info_code": {"type": "string", "description": "Report infoCode from get_a_reports record"},
-       "target_dir": {"type": "string", "description": "Save directory (default ./reports)"}})
+       "target_dir": {"type": "string", "description": "保存目录（已废弃：一律存 REPORTS_DIR，参数忽略）"}})
 def download_report_pdf(info_code: str, target_dir: str = "./reports") -> str:
     import re as _re
-    from pathlib import Path as _Path
     try:
+        # info_code 直接拼进 URL 和文件名，必须消毒（防 URL 注入 + 路径穿越）；
+        # target_dir 不再采纳：写盘目录锁定 REPORTS_DIR，杜绝任意路径写
+        if not _re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", info_code or ""):
+            return '{"error":"invalid info_code"}'
         url = PDF_TPL.format(info_code=info_code)
         r = em_get(url, headers={"Referer": "https://data.eastmoney.com/"}, timeout=60)
         if r.status_code == 200 and len(r.content) >= 1024:
-            target = _Path(target_dir)
-            target.mkdir(parents=True, exist_ok=True)
-            fpath = target / f"H3_{info_code}_1.pdf"
+            REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+            fpath = REPORTS_DIR / f"H3_{info_code}_1.pdf"
             fpath.write_bytes(r.content)
             return '{"path":"%s","size":%d}' % (str(fpath), len(r.content))
         return '{"error":"Download failed, status=%d size=%d"}' % (r.status_code, len(r.content))
