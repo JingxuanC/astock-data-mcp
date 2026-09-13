@@ -39,6 +39,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # 复用 sidecar 的工具注册表（HANDLERS: name→callable, TOOLS: name→ToolDef）
 from server import HANDLERS, TOOLS  # noqa: F401  — 副作用：注册全部工具
 
+
+def _result_is_error(result) -> bool:
+    """handler 返回 {"error": ...} JSON 时视为失败。
+
+    与 server.py 的 tools/call 判定保持一致（该处为内联实现）。此处曾硬编码
+    isError=False，导致错误 JSON 被当作成功结果返回给 LLM。
+    """
+    if not isinstance(result, str):
+        return False
+    try:
+        parsed = json.loads(result)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(parsed, dict) and "error" in parsed
+
 from mcp_gateway import METRICS, JobQueue, LicenseStore, QueueFull, QuotaExceeded
 
 logger = logging.getLogger("domain-mcp")
@@ -248,9 +263,10 @@ class DomainHandler(BaseHTTPRequestHandler):
             t0 = time.time()
             try:
                 result = HANDLERS[tool_name](**tool_args)
-                METRICS.inc_call(tool_name, "ok")
+                _is_err = _result_is_error(result)
+                METRICS.inc_call(tool_name, "error" if _is_err else "ok")
                 self._send(200, {"jsonrpc": "2.0", "id": mid, "result": {
-                    "content": [{"type": "text", "text": str(result)}], "isError": False}})
+                    "content": [{"type": "text", "text": str(result)}], "isError": _is_err}})
             except Exception as e:  # noqa: BLE001
                 METRICS.inc_call(tool_name, "error")
                 logger.error("tool call error %s: %s", tool_name, e)

@@ -192,7 +192,49 @@ def _cache_get(tool_name: str, *args) -> Optional[Any]:
     return None
 
 
+# 只描述"这层结构本身"的元数据键：它们的存在不证明拿到了业务数据
+_META_KEYS = {"date", "total", "total_records", "count", "category", "code",
+              "symbol", "source", "note", "market", "ts"}
+
+
+def _is_empty_result(value: Any) -> bool:
+    """空结果判定：None / 空容器 / 空 JSON 串（[]、{}）/ 全空字段都算空。
+
+    上游限流或空响应常返回 []/{}，若照常写缓存，TTL 内所有调用方都会拿到
+    假"无数据"。注意 json.dumps([]) == "[]" 是**非空字符串**，所以不能只
+    判断字符串真值，必须反解 JSON 再判空。
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        s = value.strip()
+        if not s or s in ("[]", "{}", "null", "None"):
+            return True
+        try:
+            return _is_empty_result(json.loads(s))
+        except (ValueError, TypeError):
+            return False  # 非 JSON 文本（如纯文本行情）视为有内容
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, (int, float)):
+        return value == 0
+    if isinstance(value, (list, tuple, set)):
+        return len(value) == 0 or all(_is_empty_result(v) for v in value)
+    if isinstance(value, dict):
+        if not value:
+            return True
+        data_vals = [v for k, v in value.items() if k not in _META_KEYS]
+        if not data_vals:
+            return False  # 只有元数据字段，不足以判定为空
+        return all(_is_empty_result(v) for v in data_vals)
+    return False
+
+
 def _cache_set(tool_name: str, value: Any, *args) -> None:
+    # 空结果不缓存（调用点也各自加了守卫，这里是最后一道防线）
+    if _is_empty_result(value):
+        logger.debug("skip caching empty result: %s", tool_name)
+        return
     p = _cache_path(tool_name, *args)
     tmp = p.with_suffix(".tmp")
     try:
@@ -222,11 +264,26 @@ def tool(name: str, description: str, properties: dict, required: Optional[list]
         TOOLS[name] = ToolDef(name, description, {
             "type": "object",
             "properties": properties,
-            "required": required or list(properties.keys()),
+            # 只有显式声明 required 的参数才进必需列表；缺省 = 全部可选
+            # （旧实现把 properties 的全部键都当必填，可选参数被系统性错标：
+            #   实测 45 个工具里 27 个工具、33 个可选参数被标成 required）
+            "required": required or [],
         })
         HANDLERS[name] = fn
         return fn
     return deco
+
+
+def fail(msg, code="error", hint=""):
+    """统一错误出口：保证合法 JSON，并让 LLM 能据此纠正。
+
+    旧写法用 %s 直接拼异常字符串、未做转义，异常信息里带引号时
+    （例如 KeyError:'data'）会产出非法 JSON，客户端解析直接失败。
+    """
+    payload = {"error": str(msg), "code": code}
+    if hint:
+        payload["hint"] = hint
+    return json.dumps(payload, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -289,7 +346,7 @@ def _sina_fetch_klines(symbol: str, count: int) -> list[dict]:
 
 
 @tool("get_a_realtime", "A-share realtime quotes (Tencent). Batch: '600519,000001'",
-      {"symbol": {"type": "string", "description": "Code or comma-separated codes"}})
+      {"symbol": {"type": "string", "description": "Code or comma-separated codes"}}, required=['symbol'])
 def get_a_realtime(symbol: str) -> str:
     import json as _json
     syms = [s.strip() for s in symbol.split(",") if s.strip()]
@@ -300,14 +357,14 @@ def get_a_realtime(symbol: str) -> str:
         data = _tencent_fetch(full)
         return _json.dumps(list(data.values()), ensure_ascii=False)
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_hist", "A-share daily K-line (Sina source).",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"},
        "count": {"type": "integer", "description": "Number of bars (default 100)"},
        "start": {"type": "string", "description": "Start date YYYY-MM-DD (optional, range query)"},
-       "end": {"type": "string", "description": "End date YYYY-MM-DD (optional, range query)"}})
+       "end": {"type": "string", "description": "End date YYYY-MM-DD (optional, range query)"}}, required=['symbol'])
 def get_a_hist(symbol: str, count: int = 100, start: str = None, end: str = None) -> str:
     import json as _json
     cached = _cache_get("get_a_hist", symbol, str(count), start or "", end or "")
@@ -323,10 +380,11 @@ def get_a_hist(symbol: str, count: int = 100, start: str = None, end: str = None
         else:
             data = _sina_fetch_klines(symbol, count)
         result = _json.dumps(data, ensure_ascii=False)
-        _cache_set("get_a_hist", result, symbol, str(count), start or "", end or "")
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_hist", result, symbol, str(count), start or "", end or "")
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_time_info", "Current time and last A-share trading day.",
@@ -373,7 +431,7 @@ def get_a_indices(indices: str = "sh,sz,cy,hs300") -> str:
             result.append(d)
         return _json.dumps(result, ensure_ascii=False)
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -409,7 +467,7 @@ def get_a_north_flow(days: int = 5) -> str:
         }]
         return _json.dumps(result, ensure_ascii=False)
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -417,7 +475,7 @@ def get_a_north_flow(days: int = 5) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 @tool("get_a_search", "Search A-share stocks by name or code. Returns matching tickers.",
-      {"query": {"type": "string", "description": "Stock name or code (e.g. '茅台', '600519')"}})
+      {"query": {"type": "string", "description": "Stock name or code (e.g. '茅台', '600519')"}}, required=['query'])
 def get_a_search(query: str) -> str:
     import json as _json, urllib.request, urllib.parse
     try:
@@ -428,7 +486,8 @@ def get_a_search(query: str) -> str:
         })
         with urllib.request.urlopen(req, timeout=10) as resp:
             raw = resp.read().decode("gbk", errors="replace")
-        # Response format: v_hint="1~茅台~600519~...~0.00~0.00~..."
+        # 上游格式：v_hint="sh~600519~贵州茅台~gzmt~GP-A"
+        #   f0=市场(sh/sz) f1=代码 f2=名称 f3=拼音 f4=类型(GP-A 主板A股 / GP-A-KCB 科创板)
         if not raw or "~" not in raw:
             return "[]"
         results = []
@@ -438,15 +497,15 @@ def get_a_search(query: str) -> str:
                 parts = content.split("~")
                 if len(parts) >= 4:
                     results.append({
-                        "name": parts[1], "code": parts[2],
-                        "market": "SH" if parts[2].startswith(("60","68","5","9")) else "SZ",
-                        "type": parts[3],  # GP-A=主板A股, GP-A-KCB=科创板
+                        "code": parts[1], "name": parts[2],
+                        "market": (parts[0] or "").upper(),  # 直接用上游的市场段 sh/sz → SH/SZ
+                        "type": parts[4] if len(parts) > 4 else parts[3],
                     })
             except (IndexError, ValueError):
                 continue
         return _json.dumps(results, ensure_ascii=False)
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -455,7 +514,7 @@ def get_a_search(query: str) -> str:
 
 @tool("get_a_financials", "A-share key financial metrics: PE, PB, market cap, EPS (derived from Tencent quote).",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"},
-       "annual": {"type": "boolean", "description": "True=annual, False=latest quarter (default: True)"}})
+       "annual": {"type": "boolean", "description": "True=annual, False=latest quarter (default: True)"}}, required=['symbol'])
 def get_a_financials(symbol: str, annual: bool = True) -> str:
     import json as _json
     # Normalize symbol
@@ -516,7 +575,7 @@ def get_a_financials(symbol: str, annual: bool = True) -> str:
         }]
         return _json.dumps(result, ensure_ascii=False)
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -524,7 +583,7 @@ def get_a_financials(symbol: str, annual: bool = True) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 @tool("get_a_intraday", "A-share intraday minute price/volume. Returns recent minute bars.",
-      {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"}})
+      {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"}}, required=['symbol'])
 def get_a_intraday(symbol: str) -> str:
     import json as _json, urllib.request
     code = symbol if symbol.startswith(("sh","sz")) else (
@@ -553,7 +612,7 @@ def get_a_intraday(symbol: str) -> str:
                 result.append({"t": str(b[0]), "p": float(b[1])})
         return _json.dumps(result, ensure_ascii=False)
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 # ═══════════════════════════════════════════════
@@ -567,7 +626,7 @@ PDF_TPL = "https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf"
 @tool("get_a_reports", "Get institutional research reports for an A-share stock (Eastmoney). "
       "Returns title, org, date, rating, EPS forecasts, infoCode for PDF download.",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '688017')"},
-       "max_pages": {"type": "integer", "description": "Max pages to fetch (default 5)"}})
+       "max_pages": {"type": "integer", "description": "Max pages to fetch (default 5)"}}, required=['symbol'])
 def get_a_reports(symbol: str, max_pages: int = 5) -> str:
     import json as _json
     cached = _cache_get("get_a_reports", symbol, str(max_pages))
@@ -594,10 +653,11 @@ def get_a_reports(symbol: str, max_pages: int = 5) -> str:
             if page >= (d.get("TotalPage", 1) or 1):
                 break
         result = _json.dumps(all_records, ensure_ascii=False)
-        _cache_set("get_a_reports", result, symbol, str(max_pages))
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_reports", result, symbol, str(max_pages))
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_industry_reports", "Get industry research reports (Eastmoney). industry_code='*'=all, "
@@ -628,10 +688,11 @@ def get_a_industry_reports(industry_code: str = "*", max_pages: int = 3) -> str:
             if page >= (d.get("TotalPage", 1) or 1):
                 break
         result = _json.dumps(all_records, ensure_ascii=False)
-        _cache_set("get_a_industry_reports", result, industry_code, str(max_pages))
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_industry_reports", result, industry_code, str(max_pages))
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 REPORTS_DIR = Path(os.environ.get("REPORTS_DIR", str(CACHE_DIR.parent / "reports")))
@@ -640,7 +701,7 @@ REPORTS_DIR = Path(os.environ.get("REPORTS_DIR", str(CACHE_DIR.parent / "reports
 @tool("download_report_pdf", "Download a research report PDF by infoCode. Returns saved file path. "
       "Files are saved under a fixed server-side reports dir (REPORTS_DIR env).",
       {"info_code": {"type": "string", "description": "Report infoCode from get_a_reports record"},
-       "target_dir": {"type": "string", "description": "保存目录（已废弃：一律存 REPORTS_DIR，参数忽略）"}})
+       "target_dir": {"type": "string", "description": "保存目录（已废弃：一律存 REPORTS_DIR，参数忽略）"}}, required=['info_code'])
 def download_report_pdf(info_code: str, target_dir: str = "./reports") -> str:
     import re as _re
     try:
@@ -657,7 +718,7 @@ def download_report_pdf(info_code: str, target_dir: str = "./reports") -> str:
             return '{"path":"%s","size":%d}' % (str(fpath), len(r.content))
         return '{"error":"Download failed, status=%d size=%d"}' % (r.status_code, len(r.content))
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 # ═══════════════════════════════════════════════
@@ -667,7 +728,7 @@ def download_report_pdf(info_code: str, target_dir: str = "./reports") -> str:
 @tool("get_a_eps_forecast", "Get institutional consensus EPS forecast from THS (10jqka). "
       "Returns analyst count, min/mean/max EPS per year. 'mean' = consensus. "
       "Warning: analyst_count < 3 = low confidence.",
-      {"symbol": {"type": "string", "description": "Stock code (e.g. '688017')"}})
+      {"symbol": {"type": "string", "description": "Stock code (e.g. '688017')"}}, required=['symbol'])
 def get_a_eps_forecast(symbol: str) -> str:
     import json as _json
     from io import StringIO as _StringIO
@@ -687,13 +748,15 @@ def get_a_eps_forecast(symbol: str) -> str:
             cols = [str(c) for c in df.columns]
             if any("每股收益" in c or "均值" in c for c in cols):
                 result = df.to_json(orient="records", force_ascii=False)
-                _cache_set("get_a_eps_forecast", result, symbol)
+                if not _is_empty_result(result):  # 空结果不缓存
+                    _cache_set("get_a_eps_forecast", result, symbol)
                 return result
         result = dfs[0].to_json(orient="records", force_ascii=False) if dfs else "[]"
-        _cache_set("get_a_eps_forecast", result, symbol)
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_eps_forecast", result, symbol)
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 # ═══════════════════════════════════════════════
@@ -718,13 +781,14 @@ def get_a_hot_reason(date: str = None) -> str:
         r = _get_requests().get(url, headers=headers, timeout=10)
         data = r.json()
         if data.get("errocode", 0) != 0:
-            return '{"error":"%s"}' % data.get("errormsg", "unknown")
+            return fail(data.get("errormsg", "unknown"), code="upstream_error")
         rows = data.get("data") or []
         result = _json.dumps(rows, ensure_ascii=False)
-        _cache_set("get_a_hot_reason", result, date or "today")
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_hot_reason", result, date or "today")
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_north_flow_minute", "Real-time minute-level northbound capital flow (沪深股通). "
@@ -749,17 +813,18 @@ def get_a_north_flow_minute(save_snapshot: bool = False) -> str:
         hgt = d.get("hgt", [])
         sgt = d.get("sgt", [])
         result = _json.dumps({"times": times, "hgt_yi": hgt, "sgt_yi": sgt}, ensure_ascii=False)
-        _cache_set("get_a_north_flow_minute", result, str(save_snapshot))
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_north_flow_minute", result, str(save_snapshot))
         if save_snapshot and not d.get("time"):
             pass  # Market closed, no data to save
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_concept_blocks", "Get all sector/concept/region blocks a stock belongs to (Eastmoney slist). "
       "Returns board names, BK codes, change%, and lead stock. Used for theme attribution.",
-      {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"}})
+      {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"}}, required=['symbol'])
 def get_a_concept_blocks(symbol: str) -> str:
     import json as _json
     cached = _cache_get("get_a_concept_blocks", symbol)
@@ -789,16 +854,17 @@ def get_a_concept_blocks(symbol: str) -> str:
             })
         result = _json.dumps({"total": len(boards), "boards": boards,
                               "concept_tags": [b["name"] for b in boards]}, ensure_ascii=False)
-        _cache_set("get_a_concept_blocks", result, symbol)
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_concept_blocks", result, symbol)
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_fund_flow_minute", "Intraday minute-level fund flow (主力/超大单/大单/中单/小单 net inflow). "
       "Unit: CNY. Use klt=1 for minute, klt=5 for 5-min, klt=101 for daily.",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '000858')"},
-       "klt": {"type": "integer", "description": "Bar size: 1=minute, 5=5min, 101=daily (default 1)"}})
+       "klt": {"type": "integer", "description": "Bar size: 1=minute, 5=5min, 101=daily (default 1)"}}, required=['symbol'])
 def get_a_fund_flow_minute(symbol: str, klt: int = 1) -> str:
     import json as _json
     cached = _cache_get("get_a_fund_flow_minute", symbol, str(klt))
@@ -829,16 +895,17 @@ def get_a_fund_flow_minute(symbol: str, klt: int = 1) -> str:
                     "super_net": float(parts[5]),
                 })
         result = _json.dumps(rows, ensure_ascii=False)
-        _cache_set("get_a_fund_flow_minute", result, symbol, str(klt))
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_fund_flow_minute", result, symbol, str(klt))
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_dragon_tiger", "Get dragon tiger board (龙虎榜) records for a stock:上榜记录 + 买卖席位 TOP5 + 机构动向.",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '002475')"},
        "trade_date": {"type": "string", "description": "Trade date YYYY-MM-DD"},
-       "look_back": {"type": "integer", "description": "Look-back days (default 30)"}})
+       "look_back": {"type": "integer", "description": "Look-back days (default 30)"}}, required=['symbol', 'trade_date'])
 def get_a_dragon_tiger(symbol: str, trade_date: str, look_back: int = 30) -> str:
     import json as _json
     from datetime import datetime as _dt, timedelta as _td
@@ -898,16 +965,17 @@ def get_a_dragon_tiger(symbol: str, trade_date: str, look_back: int = 30) -> str
             institution["sell_wan"] = round(institution["sell_wan"], 1)
             institution["net_wan"] = round(institution["buy_wan"] - institution["sell_wan"], 1)
         result = _json.dumps({"records": records, "seats": seats, "institution": institution}, ensure_ascii=False)
-        _cache_set("get_a_dragon_tiger", result, symbol, trade_date, str(look_back))
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_dragon_tiger", result, symbol, trade_date, str(look_back))
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_lockup_expiry", "Get lockup expiry calendar (限售解禁): historical + upcoming 90 days.",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '002475')"},
        "trade_date": {"type": "string", "description": "Trade date YYYY-MM-DD"},
-       "forward_days": {"type": "integer", "description": "Days to look forward (default 90)"}})
+       "forward_days": {"type": "integer", "description": "Days to look forward (default 90)"}}, required=['symbol', 'trade_date'])
 def get_a_lockup_expiry(symbol: str, trade_date: str, forward_days: int = 90) -> str:
     import json as _json
     from datetime import datetime as _dt, timedelta as _td
@@ -944,10 +1012,11 @@ def get_a_lockup_expiry(symbol: str, trade_date: str, forward_days: int = 90) ->
                 "ratio": row.get("FREE_RATIO", 0),
             })
         result = _json.dumps({"history": history, "upcoming": upcoming}, ensure_ascii=False)
-        _cache_set("get_a_lockup_expiry", result, symbol, trade_date, str(forward_days))
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_lockup_expiry", result, symbol, trade_date, str(forward_days))
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_industry_rank", "Get sector ranking by change% (全行业涨跌幅排名). Returns top N and bottom N sectors.",
@@ -985,10 +1054,11 @@ def get_a_industry_rank(top_n: int = 20) -> str:
             })
         result = _json.dumps({"top": rows[:top_n], "bottom": rows[-top_n:],
                               "total": len(rows)}, ensure_ascii=False)
-        _cache_set("get_a_industry_rank", result, str(top_n))
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_industry_rank", result, str(top_n))
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_daily_dragon_tiger", "Get market-wide dragon tiger board for a day (全市场龙虎榜). "
@@ -1029,10 +1099,11 @@ def get_a_daily_dragon_tiger(trade_date: str = None, min_net_buy_wan: float = No
                 "turnover_pct": round(float(row.get("TURNOVERRATE") or 0), 2),
             })
         result = _json.dumps({"date": actual_date, "total_records": len(stocks), "stocks": stocks}, ensure_ascii=False)
-        _cache_set("get_a_daily_dragon_tiger", result, trade_date, str(min_net_buy_wan or ""))
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_daily_dragon_tiger", result, trade_date, str(min_net_buy_wan or ""))
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 # ═══════════════════════════════════════════════
@@ -1041,7 +1112,7 @@ def get_a_daily_dragon_tiger(trade_date: str = None, min_net_buy_wan: float = No
 
 @tool("get_a_margin", "Get margin trading details (融资融券): balance, buy, repay, short balance per day.",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"},
-       "page_size": {"type": "integer", "description": "Records to fetch (default 30)"}})
+       "page_size": {"type": "integer", "description": "Records to fetch (default 30)"}}, required=['symbol'])
 def get_a_margin(symbol: str, page_size: int = 30) -> str:
     import json as _json
     cached = _cache_get("get_a_margin", symbol, str(page_size))
@@ -1066,15 +1137,16 @@ def get_a_margin(symbol: str, page_size: int = 30) -> str:
                 "rzrqye": row.get("RZRQYE", 0),
             })
         result = _json.dumps(rows, ensure_ascii=False)
-        _cache_set("get_a_margin", result, symbol, str(page_size))
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_margin", result, symbol, str(page_size))
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_block_trade", "Get block trade records (大宗交易): price, volume, buyer/seller, premium%.",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"},
-       "page_size": {"type": "integer", "description": "Records to fetch (default 20)"}})
+       "page_size": {"type": "integer", "description": "Records to fetch (default 20)"}}, required=['symbol'])
 def get_a_block_trade(symbol: str, page_size: int = 20) -> str:
     import json as _json
     cached = _cache_get("get_a_block_trade", symbol, str(page_size))
@@ -1101,15 +1173,16 @@ def get_a_block_trade(symbol: str, page_size: int = 20) -> str:
                 "seller": row.get("SELLER_NAME", ""),
             })
         result = _json.dumps(rows, ensure_ascii=False)
-        _cache_set("get_a_block_trade", result, symbol, str(page_size))
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_block_trade", result, symbol, str(page_size))
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_holder_num", "Get shareholder count changes (股东户数变化). Fewer holders = concentration = accumulation signal.",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"},
-       "page_size": {"type": "integer", "description": "Records to fetch (default 10)"}})
+       "page_size": {"type": "integer", "description": "Records to fetch (default 10)"}}, required=['symbol'])
 def get_a_holder_num(symbol: str, page_size: int = 10) -> str:
     import json as _json
     cached = _cache_get("get_a_holder_num", symbol, str(page_size))
@@ -1131,15 +1204,16 @@ def get_a_holder_num(symbol: str, page_size: int = 10) -> str:
                 "avg_shares": row.get("AVG_FREE_SHARES", 0),
             })
         result = _json.dumps(rows, ensure_ascii=False)
-        _cache_set("get_a_holder_num", result, symbol, str(page_size))
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_holder_num", result, symbol, str(page_size))
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_dividend", "Get dividend history (分红送转): bonus per share, transfer ratio, bonus ratio.",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"},
-       "page_size": {"type": "integer", "description": "Records to fetch (default 20)"}})
+       "page_size": {"type": "integer", "description": "Records to fetch (default 20)"}}, required=['symbol'])
 def get_a_dividend(symbol: str, page_size: int = 20) -> str:
     import json as _json
     cached = _cache_get("get_a_dividend", symbol, str(page_size))
@@ -1161,14 +1235,15 @@ def get_a_dividend(symbol: str, page_size: int = 20) -> str:
                 "plan": row.get("ASSIGN_PROGRESS", ""),
             })
         result = _json.dumps(rows, ensure_ascii=False)
-        _cache_set("get_a_dividend", result, symbol, str(page_size))
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_dividend", result, symbol, str(page_size))
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_fund_flow_120d", "Get daily fund flow for last 120 trading days: main/super/large/mid/small net. Unit: CNY.",
-      {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"}})
+      {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"}}, required=['symbol'])
 def get_a_fund_flow_120d(symbol: str) -> str:
     import json as _json
     cached = _cache_get("get_a_fund_flow_120d", symbol)
@@ -1201,10 +1276,11 @@ def get_a_fund_flow_120d(symbol: str) -> str:
                     "super_net": float(parts[5]) if parts[5] != "-" else 0,
                 })
         result = _json.dumps(rows, ensure_ascii=False)
-        _cache_set("get_a_fund_flow_120d", result, symbol)
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_fund_flow_120d", result, symbol)
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 # ═══════════════════════════════════════════════
@@ -1213,7 +1289,7 @@ def get_a_fund_flow_120d(symbol: str) -> str:
 
 @tool("get_a_news", "Get stock-specific news from Eastmoney (个股新闻). Returns title, content, time, source, URL.",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '688017')"},
-       "page_size": {"type": "integer", "description": "Articles to fetch (default 20)"}})
+       "page_size": {"type": "integer", "description": "Articles to fetch (default 20)"}}, required=['symbol'])
 def get_a_news(symbol: str, page_size: int = 20) -> str:
     import json as _json, re as _re
     cached = _cache_get("get_a_news", symbol, str(page_size))
@@ -1246,17 +1322,18 @@ def get_a_news(symbol: str, page_size: int = 20) -> str:
                 "url": a.get("url", ""),
             })
         result = _json.dumps(rows, ensure_ascii=False)
-        _cache_set("get_a_news", result, symbol, str(page_size))
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_news", result, symbol, str(page_size))
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 # ═══════════════════════════════════════════════
 # 40-43. Fundamental data layer (基础数据层)
 # ═══════════════════════════════════════════════
 
 @tool("get_a_mootdx_finance", "Get 37-field quarterly financial snapshot via mootdx: EPS, ROE, BVPS, revenue, profit, etc.",
-      {"symbol": {"type": "string", "description": "Stock code (e.g. '688017')"}})
+      {"symbol": {"type": "string", "description": "Stock code (e.g. '688017')"}}, required=['symbol'])
 def get_a_mootdx_finance(symbol: str) -> str:
     import json as _json
     cached = _cache_get("get_a_mootdx_finance", symbol)
@@ -1268,15 +1345,16 @@ def get_a_mootdx_finance(symbol: str) -> str:
         fin = client.finance(symbol=symbol)
         # Convert to serializable dict
         result = _json.dumps(dict(fin) if hasattr(fin, 'items') else str(fin), ensure_ascii=False)
-        _cache_set("get_a_mootdx_finance", result, symbol)
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_mootdx_finance", result, symbol)
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_mootdx_f10", "Get company F10 text data (9 categories): 最新提示/公司概况/财务分析/股东研究/股本结构/资本运作/业内点评/行业分析/公司大事.",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '688017')"},
-       "category": {"type": "string", "description": "Category: 最新提示/公司概况/财务分析/股东研究/股本结构/资本运作/业内点评/行业分析/公司大事 (default 最新提示)"}})
+       "category": {"type": "string", "description": "Category: 最新提示/公司概况/财务分析/股东研究/股本结构/资本运作/业内点评/行业分析/公司大事 (default 最新提示)"}}, required=['symbol'])
 def get_a_mootdx_f10(symbol: str, category: str = "最新提示") -> str:
     import json as _json
     cached = _cache_get("get_a_mootdx_f10", symbol, category)
@@ -1286,14 +1364,15 @@ def get_a_mootdx_f10(symbol: str, category: str = "最新提示") -> str:
         client = tdx_client()
         text = client.F10(symbol=symbol, name=category)
         result = _json.dumps({"category": category, "content": text or ""}, ensure_ascii=False)
-        _cache_set("get_a_mootdx_f10", result, symbol, category)
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_mootdx_f10", result, symbol, category)
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_stock_info", "Get A-share basic info: industry, total/float shares, market cap, list date (Eastmoney push2).",
-      {"symbol": {"type": "string", "description": "Stock code (e.g. '688017')"}})
+      {"symbol": {"type": "string", "description": "Stock code (e.g. '688017')"}}, required=['symbol'])
 def get_a_stock_info(symbol: str) -> str:
     import json as _json
     cached = _cache_get("get_a_stock_info", symbol)
@@ -1321,16 +1400,17 @@ def get_a_stock_info(symbol: str) -> str:
             "price": d.get("f43", 0),
         }
         result = _json.dumps(info, ensure_ascii=False)
-        _cache_set("get_a_stock_info", result, symbol)
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_stock_info", result, symbol)
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_financial_statements", "Get Sina financial statements (新浪财报三表): balance sheet, income statement, cash flow.",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"},
        "report_type": {"type": "string", "description": "'fzb'=balance sheet, 'lrb'=income, 'llb'=cashflow (default 'lrb')"},
-       "num": {"type": "integer", "description": "Number of periods (default 8)"}})
+       "num": {"type": "integer", "description": "Number of periods (default 8)"}}, required=['symbol'])
 def get_a_financial_statements(symbol: str, report_type: str = "lrb", num: int = 8) -> str:
     import json as _json
     cached = _cache_get("get_a_financial_statements", symbol, report_type, str(num))
@@ -1361,10 +1441,11 @@ def get_a_financial_statements(symbol: str, report_type: str = "lrb", num: int =
                     rec[title + "_yoy"] = tongbi
             rows.append(rec)
         result = _json.dumps(rows, ensure_ascii=False)
-        _cache_set("get_a_financial_statements", result, symbol, report_type, str(num))
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_financial_statements", result, symbol, report_type, str(num))
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 # ═══════════════════════════════════════════════
@@ -1395,7 +1476,7 @@ def _cninfo_orgid(code: str) -> str:
 
 @tool("get_a_announcements", "Get full-text announcements from cninfo (巨潮公告). Returns title, type, date, URL.",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '688017')"},
-       "page_size": {"type": "integer", "description": "Records to fetch (default 30)"}})
+       "page_size": {"type": "integer", "description": "Records to fetch (default 30)"}}, required=['symbol'])
 def get_a_announcements(symbol: str, page_size: int = 30) -> str:
     import json as _json
     from datetime import datetime as _dt
@@ -1434,10 +1515,11 @@ def get_a_announcements(symbol: str, page_size: int = 30) -> str:
                 "url": f"https://www.cninfo.com.cn/new/disclosure/detail?annoId={item.get('announcementId', '')}",
             })
         result = _json.dumps(rows, ensure_ascii=False)
-        _cache_set("get_a_announcements", result, symbol, str(page_size))
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_announcements", result, symbol, str(page_size))
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 # ═══════════════════════════════════════════════
@@ -1464,7 +1546,7 @@ def _em_zt_api(endpoint: str, sort: str, date: str) -> list:
 
 
 @tool("get_a_limit_up_pool", "Get today's limit-up pool (涨停池): name, code, price, pct, limit_days, seal time, seal fund, break_times, industry.",
-      {"date": {"type": "string", "description": "Trade date YYYYMMDD (e.g. '20260626')"}})
+      {"date": {"type": "string", "description": "Trade date YYYYMMDD (e.g. '20260626')"}}, required=['date'])
 def get_a_limit_up_pool(date: str) -> str:
     import json as _json
     cached = _cache_get("get_a_limit_up_pool", date)
@@ -1485,14 +1567,15 @@ def get_a_limit_up_pool(date: str) -> str:
                 "zt_stat": f"{(p.get('zttj') or {}).get('days','?')}天{(p.get('zttj') or {}).get('ct','?')}板",
             })
         result = _json.dumps(out, ensure_ascii=False)
-        _cache_set("get_a_limit_up_pool", result, date)
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_limit_up_pool", result, date)
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_broken_board", "Get today's broken board pool (炸板池): stocks that hit limit-up then opened.",
-      {"date": {"type": "string", "description": "Trade date YYYYMMDD (e.g. '20260626')"}})
+      {"date": {"type": "string", "description": "Trade date YYYYMMDD (e.g. '20260626')"}}, required=['date'])
 def get_a_broken_board(date: str) -> str:
     import json as _json
     cached = _cache_get("get_a_broken_board", date)
@@ -1511,14 +1594,15 @@ def get_a_broken_board(date: str) -> str:
                 "zt_stat": f"{(p.get('zttj') or {}).get('days','?')}天{(p.get('zttj') or {}).get('ct','?')}板",
             })
         result = _json.dumps(out, ensure_ascii=False)
-        _cache_set("get_a_broken_board", result, date)
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_broken_board", result, date)
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_limit_down_pool", "Get today's limit-down pool (跌停池).",
-      {"date": {"type": "string", "description": "Trade date YYYYMMDD (e.g. '20260626')"}})
+      {"date": {"type": "string", "description": "Trade date YYYYMMDD (e.g. '20260626')"}}, required=['date'])
 def get_a_limit_down_pool(date: str) -> str:
     import json as _json
     cached = _cache_get("get_a_limit_down_pool", date)
@@ -1536,14 +1620,15 @@ def get_a_limit_down_pool(date: str) -> str:
                 "open_times": p.get("oc"), "industry": p.get("hybk", ""),
             })
         result = _json.dumps(out, ensure_ascii=False)
-        _cache_set("get_a_limit_down_pool", result, date)
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_limit_down_pool", result, date)
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_yesterday_zt", "Get yesterday's limit-up performance today (昨涨停今表现). Used to calculate promotion rate.",
-      {"date": {"type": "string", "description": "Trade date YYYYMMDD (e.g. '20260626')"}})
+      {"date": {"type": "string", "description": "Trade date YYYYMMDD (e.g. '20260626')"}}, required=['date'])
 def get_a_yesterday_zt(date: str) -> str:
     import json as _json
     cached = _cache_get("get_a_yesterday_zt", date)
@@ -1561,14 +1646,15 @@ def get_a_yesterday_zt(date: str) -> str:
                 "zt_stat": f"{(p.get('zttj') or {}).get('days','?')}天{(p.get('zttj') or {}).get('ct','?')}板",
             })
         result = _json.dumps(out, ensure_ascii=False)
-        _cache_set("get_a_yesterday_zt", result, date)
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_yesterday_zt", result, date)
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_zt_reason", "Get limit-up reason/themes from THS (同花顺涨停揭秘): reason tags, board type, seal rate.",
-      {"date": {"type": "string", "description": "Trade date YYYYMMDD (e.g. '20260626')"}})
+      {"date": {"type": "string", "description": "Trade date YYYYMMDD (e.g. '20260626')"}}, required=['date'])
 def get_a_zt_reason(date: str) -> str:
     import json as _json
     from datetime import datetime as _dt
@@ -1600,15 +1686,16 @@ def get_a_zt_reason(date: str) -> str:
                 "is_again": it.get("is_again_limit"),
             })
         result = _json.dumps(out, ensure_ascii=False)
-        _cache_set("get_a_zt_reason", result, date)
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_zt_reason", result, date)
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_board_emotion", "Calculate limit-up sentiment: break_rate, max_height, ladder (连板梯队), ZT/DT counts. "
       "Break rate >40% = bearish, <20% = bullish.",
-      {"date": {"type": "string", "description": "Trade date YYYYMMDD (e.g. '20260626')"}})
+      {"date": {"type": "string", "description": "Trade date YYYYMMDD (e.g. '20260626')"}}, required=['date'])
 def get_a_board_emotion(date: str) -> str:
     import json as _json
     cached = _cache_get("get_a_board_emotion", date)
@@ -1629,10 +1716,11 @@ def get_a_board_emotion(date: str) -> str:
             "ladder": dict(sorted(ladder.items())),
         }
         result = _json.dumps(sentiment, ensure_ascii=False)
-        _cache_set("get_a_board_emotion", result, date)
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_board_emotion", result, date)
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 # ═══════════════════════════════════════════════
@@ -1677,14 +1765,15 @@ def get_a_option_codes(underlying: str = "510050", call: bool = True) -> str:
             if codes:
                 out[m] = codes
         result = _json.dumps(out, ensure_ascii=False)
-        _cache_set("get_a_option_codes", result, underlying, str(call))
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_option_codes", result, underlying, str(call))
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_option_tquote", "Get ETF option T-quote: bid/ask, open_interest, strike, greeks reference.",
-      {"code": {"type": "string", "description": "Option contract code (e.g. '10005798')"}})
+      {"code": {"type": "string", "description": "Option contract code (e.g. '10005798')"}}, required=['code'])
 def get_a_option_tquote(code: str) -> str:
     import json as _json
     cached = _cache_get("get_a_option_tquote", code)
@@ -1703,15 +1792,16 @@ def get_a_option_tquote(code: str) -> str:
             "low": _opt_f(v[40]), "volume": _opt_f(v[41]), "amount": _opt_f(v[42]),
         }
         result = _json.dumps(quote, ensure_ascii=False)
-        _cache_set("get_a_option_tquote", result, code)
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_option_tquote", result, code)
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_option_greeks", "Get ETF option Greeks + IV: delta, gamma, theta, vega, IV (implied volatility). "
       "IV is decimal (0.1735 = 17.35%). Pre-computed by exchange, no local BSM needed.",
-      {"code": {"type": "string", "description": "Option contract code (e.g. '10005798')"}})
+      {"code": {"type": "string", "description": "Option contract code (e.g. '10005798')"}}, required=['code'])
 def get_a_option_greeks(code: str) -> str:
     import json as _json
     cached = _cache_get("get_a_option_greeks", code)
@@ -1732,10 +1822,11 @@ def get_a_option_greeks(code: str) -> str:
             "last": _opt_f(v[11]), "theory": _opt_f(v[12]),
         }
         result = _json.dumps(greeks, ensure_ascii=False)
-        _cache_set("get_a_option_greeks", result, code)
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_option_greeks", result, code)
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 # ═══════════════════════════════════════════════
@@ -1745,7 +1836,7 @@ def get_a_option_greeks(code: str) -> str:
 @tool("get_a_irm_qa", "Get investor Q&A from cninfo 互动易: questions investors asked + company replies. "
       "Unique source for company responses to market rumors/events.",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '002594')"},
-       "page_size": {"type": "integer", "description": "Records to fetch (default 30)"}})
+       "page_size": {"type": "integer", "description": "Records to fetch (default 30)"}}, required=['symbol'])
 def get_a_irm_qa(symbol: str, page_size: int = 30) -> str:
     import json as _json
     from datetime import datetime as _dt
@@ -1777,10 +1868,11 @@ def get_a_irm_qa(symbol: str, page_size: int = 30) -> str:
                 "ask_time": _dt.fromtimestamp(pd_ts / 1000).strftime("%Y-%m-%d %H:%M") if pd_ts else "",
             })
         result = _json.dumps(out, ensure_ascii=False)
-        _cache_set("get_a_irm_qa", result, symbol, str(page_size))
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_irm_qa", result, symbol, str(page_size))
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 _EM_HOT_BODY = {"appId": "appId01", "globalId": "786e4c21-70dc-435a-93bb-38"}
@@ -1809,10 +1901,11 @@ def get_a_hot_rank(period: str = "hour") -> str:
                 "tag": tag.get("popularity_tag", ""),
             })
         result = _json.dumps(out, ensure_ascii=False)
-        _cache_set("get_a_hot_rank", result, period)
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_hot_rank", result, period)
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_em_hot_rank", "Get Eastmoney popularity rank (东财人气榜): rank, name, price, pct, rank change.",
@@ -1845,15 +1938,16 @@ def get_a_em_hot_rank(top: int = 50) -> str:
             out.append({"rank": it["rk"], "code": code, "name": name,
                         "price": price, "pct": pct, "rank_chg": it.get("hisRc")})
         result = _json.dumps(out, ensure_ascii=False)
-        _cache_set("get_a_em_hot_rank", result, str(top))
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_em_hot_rank", result, str(top))
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 @tool("get_a_hot_concept", "Get concepts a stock is being traded under right now (东财个股热门概念命中). "
       "Returns concept name, hit count. Shows 'what story is this stock riding'.",
-      {"symbol": {"type": "string", "description": "Stock code (e.g. '601127')"}})
+      {"symbol": {"type": "string", "description": "Stock code (e.g. '601127')"}}, required=['symbol'])
 def get_a_hot_concept(symbol: str) -> str:
     import json as _json
     cached = _cache_get("get_a_hot_concept", symbol)
@@ -1868,10 +1962,11 @@ def get_a_hot_concept(symbol: str) -> str:
         out = [{"concept": x.get("conceptName"), "bk": x.get("conceptId"),
                 "hit": x.get("hitCount")} for x in data]
         result = _json.dumps(out, ensure_ascii=False)
-        _cache_set("get_a_hot_concept", result, symbol)
+        if not _is_empty_result(result):  # 空结果不缓存
+            _cache_set("get_a_hot_concept", result, symbol)
         return result
     except Exception as e:
-        return '{"error":"%s"}' % str(e)
+        return fail(e)
 
 
 # ── research_reports：Athena 源里是 /research-reports HTTP 路由 + tools/list 硬编码
@@ -2037,10 +2132,19 @@ class DataHandler(BaseHTTPRequestHandler):
             t0 = time.time()
             try:
                 result = HANDLERS[tool_name](**tool_args)
-                METRICS.inc_call(tool_name, "ok")
+                # handler 以错误 JSON（{"error": ...}）返回失败时，按 MCP 规范置 isError=True，
+                # 否则客户端/LLM 会把失败当正常结果继续用。
+                is_err = False
+                if isinstance(result, str):
+                    try:
+                        _parsed = json.loads(result)
+                        is_err = isinstance(_parsed, dict) and "error" in _parsed
+                    except (ValueError, TypeError):
+                        is_err = False
+                METRICS.inc_call(tool_name, "error" if is_err else "ok")
                 self._json(200, {"jsonrpc": "2.0", "id": mid, "result": {
                     "content": [{"type": "text", "text": str(result)}],
-                    "isError": False,
+                    "isError": is_err,
                 }})
             except Exception as e:
                 METRICS.inc_call(tool_name, "error")
