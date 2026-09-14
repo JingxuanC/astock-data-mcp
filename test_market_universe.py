@@ -70,14 +70,14 @@ def test_clist_full_page_then_empty_page_ends(monkeypatch):
 def test_clist_truncated_page_raises(monkeypatch):
     """接口只回 2 行却声称 total=5500（事故原形）→ 必须报错，绝不返回 2 只。"""
     _patch_pages(monkeypatch, {1: ["000001", "000002"]}, total=5500)
-    with pytest.raises(S.ClistDegraded, match="只取到 2/5500"):
+    with pytest.raises(S.UniverseDegraded, match="只取到 2/5500"):
         S.em_clist_all("m:0+t:6", "f12", min_expected=100)
 
 
 def test_clist_below_floor_raises(monkeypatch):
     """接口正常但总量远低于全市场量级（被限流成小列表）→ 报错。"""
     _patch_pages(monkeypatch, {1: [f"60{i:04d}" for i in range(100)]}, total=100)
-    with pytest.raises(S.ClistDegraded, match="仅返回 100 条"):
+    with pytest.raises(S.UniverseDegraded, match="仅返回 100 条"):
         S.em_clist_all("m:1+t:2", "f12", min_expected=1000)
 
 
@@ -85,7 +85,7 @@ def test_clist_max_pages_guard(monkeypatch):
     """total 异常巨大时分页有硬上限，不会死循环。"""
     pages = {pn: [f"60{i:04d}" for i in range(100)] for pn in range(1, 6)}
     calls = _patch_pages(monkeypatch, pages, total=10**9)
-    with pytest.raises(S.ClistDegraded):
+    with pytest.raises(S.UniverseDegraded):
         S.em_clist_all("m:1+t:2", "f12", max_pages=4, min_expected=1)
     assert calls == [1, 2, 3, 4]
 
@@ -217,3 +217,118 @@ def test_symbol_prefixes():
     assert S._symbol_of("300750", "0") == "sz300750"
     assert S._symbol_of("430047", "0") == "bj430047"
     assert S._symbol_of("920002", "0") == "bj920002"
+
+
+# ── 腾讯兜底：东财 clist 502/断连时仍要给出全市场 ──
+
+def _write_universe_file(tmp_path, lines):
+    f = tmp_path / "all.txt"
+    f.write_text("".join(lines))
+    return f
+
+
+def test_local_universe_codes_parses_and_filters(tmp_path, monkeypatch):
+    f = _write_universe_file(tmp_path, [
+        "SH600519\t2001-08-27\t2026-09-11\n",
+        "SZ000001\t1991-04-03\t2026-09-11\n",
+        "bj430047\t2021-01-01\t2026-09-11\n",
+        "SH000300\t2005-01-04\t2026-09-11\n",   # 指数，非个股
+        "SZ399300\t2005-01-04\t2026-09-11\n",   # 指数
+    ])
+    monkeypatch.setenv("A_UNIVERSE_FILE", str(f))
+    monkeypatch.setattr(S, "_UNIVERSE_FLOOR", 1)
+    assert S._local_universe_codes(False) == ["sh600519", "sz000001"]
+    assert S._local_universe_codes(True) == ["sh600519", "sz000001", "bj430047"]
+
+
+def test_local_universe_file_short_raises(tmp_path, monkeypatch):
+    f = _write_universe_file(tmp_path, ["SH600519\t2001-08-27\t2026-09-11\n"])
+    monkeypatch.setenv("A_UNIVERSE_FILE", str(f))
+    with pytest.raises(S.UniverseDegraded, match="本地代码表仅 1 只"):
+        S._local_universe_codes(False)
+
+
+def test_local_universe_file_missing_raises(monkeypatch):
+    monkeypatch.setenv("A_UNIVERSE_FILE", "/nonexistent/all.txt")
+    with pytest.raises(S.UniverseDegraded, match="不可读"):
+        S._local_universe_codes(False)
+
+
+def test_tencent_universe_rows_maps_fields(tmp_path, monkeypatch):
+    f = _write_universe_file(tmp_path, [
+        "SH600519\t2001-08-27\t2026-09-11\n",
+        "SZ000001\t1991-04-03\t2026-09-11\n",
+    ])
+    monkeypatch.setenv("A_UNIVERSE_FILE", str(f))
+    monkeypatch.setattr(S, "_UNIVERSE_FLOOR", 1)
+    monkeypatch.setattr(S, "_tencent_fetch", lambda syms: {
+        "600519": {"symbol": "600519", "name": "贵州茅台", "price": 1700.0,
+                   "pct_change": 1.2, "amount": 5e9, "turnover": 0.5, "market_cap": 2.1e12},
+        "000001": {"symbol": "000001", "name": "平安银行", "price": 12.0,
+                   "pct_change": -0.8, "amount": 2e9, "turnover": 0.9, "market_cap": 2.3e11},
+    })
+    rows = S._tencent_universe_rows(False)
+    assert len(rows) == 2
+    r = {x["f12"]: x for x in rows}
+    assert r["600519"]["f13"] == "1" and r["600519"]["f14"] == "贵州茅台"
+    assert r["000001"]["f13"] == "0" and r["000001"]["f20"] == 2.3e11
+    assert r["600519"]["f100"] == "" and r["600519"]["f26"] is None
+
+
+def test_tencent_universe_coverage_guard(tmp_path, monkeypatch):
+    """腾讯只回一半 → 拒绝当全市场（跨来源同样不许静默变短）。"""
+    f = _write_universe_file(tmp_path, [
+        f"SH6005{i:02d}\t2001-08-27\t2026-09-11\n" for i in range(10)
+    ])
+    monkeypatch.setenv("A_UNIVERSE_FILE", str(f))
+    monkeypatch.setattr(S, "_UNIVERSE_FLOOR", 1)
+    monkeypatch.setattr(S, "_tencent_fetch", lambda syms: {
+        "600500": {"symbol": "600500", "name": "x", "price": 1.0, "pct_change": 0.0,
+                   "amount": 1e6, "turnover": 0.1, "market_cap": 1e9},
+    })
+    with pytest.raises(S.UniverseDegraded, match="只覆盖 1/10"):
+        S._tencent_universe_rows(False)
+
+
+def test_snapshot_falls_back_to_tencent(tmp_path, monkeypatch):
+    """东财 clist 抛 502 → 快照仍给出结果，并标注 source=tencent_qt。"""
+    S.CACHE_DIR = tmp_path
+    f = _write_universe_file(tmp_path, [
+        "SH600519\t2001-08-27\t2026-09-11\n",
+        "SZ000001\t1991-04-03\t2026-09-11\n",
+    ])
+    monkeypatch.setenv("A_UNIVERSE_FILE", str(f))
+    monkeypatch.setattr(S, "_UNIVERSE_FLOOR", 1)
+    monkeypatch.setattr(S, "em_clist_all",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("502 Bad Gateway")))
+    monkeypatch.setattr(S, "_tencent_fetch", lambda syms: {
+        "600519": {"symbol": "600519", "name": "贵州茅台", "price": 1700.0,
+                   "pct_change": 3.0, "amount": 5e9, "turnover": 0.5, "market_cap": 2.1e12},
+        "000001": {"symbol": "000001", "name": "平安银行", "price": 12.0,
+                   "pct_change": -1.0, "amount": 2e9, "turnover": 0.9, "market_cap": 2.3e11},
+    })
+    out = json.loads(S.get_a_market_snapshot())
+    assert out["source"] == "tencent_qt"
+    assert out["total"] == 2 and out["up"] == 1 and out["down"] == 1
+
+
+def test_universe_falls_back_and_reports_notes(tmp_path, monkeypatch):
+    S.CACHE_DIR = tmp_path
+    f = _write_universe_file(tmp_path, [
+        "SH600519\t2001-08-27\t2026-09-11\n",
+        "SZ000001\t1991-04-03\t2026-09-11\n",
+    ])
+    monkeypatch.setenv("A_UNIVERSE_FILE", str(f))
+    monkeypatch.setattr(S, "_UNIVERSE_FLOOR", 1)
+    monkeypatch.setattr(S, "em_clist_all",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("502")))
+    monkeypatch.setattr(S, "_tencent_fetch", lambda syms: {
+        "600519": {"symbol": "600519", "name": "贵州茅台", "price": 1700.0,
+                   "pct_change": 1.0, "amount": 5e9, "turnover": 0.5, "market_cap": 2.1e12},
+        "000001": {"symbol": "000001", "name": "平安银行", "price": 12.0,
+                   "pct_change": -1.0, "amount": 2e9, "turnover": 0.9, "market_cap": 2.3e11},
+    })
+    out = json.loads(S.get_a_trade_universe(exclude_new_days=0))
+    assert out["source"] == "tencent_qt" and out["passed"] == 2
+    assert out["notes"], "兜底来源必须显式说明 industry/list_date 不可用"
+    assert {u["symbol"] for u in out["universe"]} == {"sh600519", "sz000001"}

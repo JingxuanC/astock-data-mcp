@@ -2121,8 +2121,99 @@ _FS_BJ = "m:0+t:81+s:2048"                          # 北交所
 _UNIVERSE_FLOOR = 1000                              # 全市场量级下限（低于此判为接口异常）
 
 
-class ClistDegraded(RuntimeError):
-    """东财 clist 返回的数据不完整（分页被截断 / 限流 / 异常短），拒绝当全市场使用。"""
+class UniverseDegraded(RuntimeError):
+    """universe 来源返回的数据不完整（分页被截断 / 502 / 限流 / 异常短）。
+
+    拒绝把这种结果当"全市场"使用——宁可我方报错，也不给下游一个静默截断的 universe。
+    """
+
+
+# 本地代码表（qlib cn_data 的 instruments/all.txt，由 factor-miner 的日更任务维护）
+_UNIVERSE_FILE_ENV = "A_UNIVERSE_FILE"
+_UNIVERSE_FILE_DEFAULT = "/app/.qlib/qlib_data/cn_data/instruments/all.txt"
+_A_CODE_RE = re.compile(r"^(SH|SZ|BJ)(\d{6})$")
+# 号段必须**结合市场**判断：沪市 60/68 是个股，而 sh000300 是沪深300指数、
+# 51/58 是 ETF；深市 00/30 是个股，00 在沪市却是指数。只按数字前缀判断会把指数混进 universe。
+_A_STOCK_RE = {
+    "sh": re.compile(r"^(60\d{4}|68\d{4})$"),
+    "sz": re.compile(r"^(00\d{4}|30\d{4})$"),
+    "bj": re.compile(r"^(43\d{4}|83\d{4}|87\d{4}|88\d{4}|920\d{3})$"),
+}
+_TENCENT_BATCH = 60
+
+
+def _local_universe_codes(include_bj: bool) -> list:
+    """从本地代码表读全市场代码（→ sh600519 / sz000001 / bj430047）。"""
+    path = os.environ.get(_UNIVERSE_FILE_ENV, _UNIVERSE_FILE_DEFAULT)
+    try:
+        text = Path(path).read_text()
+    except OSError as e:
+        raise UniverseDegraded(f"本地代码表不可读 {path}: {e}") from e
+    out = []
+    for line in text.splitlines():
+        m = _A_CODE_RE.match(line.split("\t")[0].strip().upper())
+        if not m:
+            continue
+        mkt, code = m.group(1).lower(), m.group(2)
+        if not _A_STOCK_RE[mkt].match(code):
+            continue  # 指数/ETF 等非个股
+        if mkt == "bj" and not include_bj:
+            continue
+        out.append(mkt + code)
+    if len(out) < _UNIVERSE_FLOOR:
+        raise UniverseDegraded(f"本地代码表仅 {len(out)} 只 (< {_UNIVERSE_FLOOR})：文件可能被截断")
+    return out
+
+
+def _tencent_universe_rows(include_bj: bool) -> list:
+    """本地代码表 + 腾讯批量行情 → 与东财 clist 行**同构**的 dict 列表。
+
+    腾讯是独立于东财的一条路（东财 clist 今天就在返 502/断连）。字段对齐 f-code，
+    使上层过滤/输出逻辑两种来源共用；腾讯没有 industry/list_date，留 None 并在
+    输出里用 source 标注，绝不假装两种来源等价。
+    """
+    codes = _local_universe_codes(include_bj)
+    by_code = {c[-6:]: c for c in codes}
+    rows, seen = [], 0
+    for i in range(0, len(codes), _TENCENT_BATCH):
+        chunk = codes[i:i + _TENCENT_BATCH]
+        try:
+            q = _tencent_fetch([c for c in chunk])
+        except Exception:  # noqa: BLE001 — 单批失败不炸整体，末尾按覆盖率兜底
+            continue
+        for k, d in q.items():
+            raw = str(d.get("symbol") or k)
+            code = raw[-6:]
+            sym = by_code.get(code)
+            if not sym:
+                continue
+            rows.append({
+                "f12": code, "f13": "1" if sym.startswith("sh") else "0",
+                "f14": d.get("name", ""), "f2": d.get("price"),
+                "f3": d.get("pct_change"), "f6": d.get("amount"),
+                "f8": d.get("turnover"), "f20": d.get("market_cap"),
+                "f21": None, "f26": None, "f100": "",
+            })
+            seen += 1
+    if seen < len(codes) * 0.8:
+        raise UniverseDegraded(f"腾讯批量行情只覆盖 {seen}/{len(codes)} 只，拒绝当全市场使用")
+    return rows
+
+
+def _load_market_rows(include_bj: bool, fields: str) -> tuple:
+    """全市场行 → (rows, source)。
+
+    东财 clist 优先（字段最全），502/断连/截断时回退"本地代码表 + 腾讯行情"。
+    两条路都不可用才抛 UniverseDegraded —— 单点故障不该让整个 universe 消失。
+    """
+    fs = _FS_SH_SZ + ("," + _FS_BJ if include_bj else "")
+    em_err = None
+    try:
+        return em_clist_all(fs, fields), "eastmoney_clist"
+    except Exception as e:  # noqa: BLE001 — 502/断连/UniverseDegraded 统一走回退
+        em_err = e
+    logger.warning("东财 clist 不可用(%s)，回退腾讯批量行情", type(em_err).__name__)
+    return _tencent_universe_rows(include_bj), "tencent_qt"
 
 
 def _clist_page(fs: str, fields: str, page: int, page_size: int = 100) -> tuple:
@@ -2137,7 +2228,7 @@ def _clist_page(fs: str, fields: str, page: int, page_size: int = 100) -> tuple:
 
 def em_clist_all(fs: str, fields: str, page_size: int = 100, max_pages: int = 90,
                  min_expected: int = None) -> list:
-    """按 total 翻完全部页；任何不完整都抛 ClistDegraded（绝不静默返回短列表）。
+    """按 total 翻完全部页；任何不完整都抛 UniverseDegraded（绝不静默返回短列表）。
 
     min_expected 走**晚绑定**读取 _UNIVERSE_FLOOR：写成默认值 `=_UNIVERSE_FLOOR`
     会在定义时求值，此后改模块常量（或按环境调阈值、测试里放宽）都不生效。
@@ -2157,10 +2248,10 @@ def em_clist_all(fs: str, fields: str, page_size: int = 100, max_pages: int = 90
         if len(diff) < page_size:
             break  # 不满一页 = 正常到底
     if total and len(rows) < total:
-        raise ClistDegraded(
+        raise UniverseDegraded(
             f"clist 只取到 {len(rows)}/{total} 条：分页被截断或限流，拒绝当全市场使用")
     if len(rows) < min_expected:
-        raise ClistDegraded(
+        raise UniverseDegraded(
             f"clist 仅返回 {len(rows)} 条（< {min_expected}）：接口异常，拒绝当全市场使用")
     return rows
 
@@ -2205,10 +2296,11 @@ def get_a_market_snapshot(include_bj: bool = False) -> str:
         return cached
     fs = _FS_SH_SZ + ("," + _FS_BJ if include_bj else "")
     try:
-        rows = em_clist_all(fs, "f3,f12,f14,f6")
-    except ClistDegraded as e:
+        rows, source = _load_market_rows(include_bj, "f3,f12,f14,f6")
+    except UniverseDegraded as e:
         return fail(str(e), code="degraded_source",
-                    hint="东财 clist 被截断或限流；稍后重试，或改用 get_a_limit_up_pool / get_a_indices")
+                    hint="东财 clist 与腾讯行情均不可用；稍后重试，"
+                         "或改用 get_a_limit_up_pool / get_a_indices")
     except Exception as e:
         return fail(e)
     pcts, amount = [], 0.0
@@ -2243,6 +2335,7 @@ def get_a_market_snapshot(include_bj: bool = False) -> str:
         else:
             buckets["涨停附近(≥9.5%)"] += 1
     result = _json.dumps({
+        "source": source,
         "scanned": len(rows), "total": n, "up": up, "down": down, "flat": n - up - down,
         "median_pct": round(pcts[n // 2], 3), "mean_pct": round(sum(pcts) / n, 3),
         "amount_yi": round(amount / 1e8, 1),
@@ -2283,12 +2376,15 @@ def get_a_trade_universe(exclude_st: bool = True, exclude_new_days: int = 60,
         return cached
     fs = _FS_SH_SZ + ("," + _FS_BJ if include_bj else "")
     try:
-        rows = em_clist_all(fs, "f12,f13,f14,f2,f3,f6,f8,f20,f21,f26,f100")
-    except ClistDegraded as e:
+        rows, source = _load_market_rows(include_bj, "f12,f13,f14,f2,f3,f6,f8,f20,f21,f26,f100")
+    except UniverseDegraded as e:
         return fail(str(e), code="degraded_source",
-                    hint="东财 clist 被截断或限流；稍后重试。绝不返回静默截断的 universe")
+                    hint="东财 clist 与腾讯行情均不可用；稍后重试。绝不返回静默截断的 universe")
     except Exception as e:
         return fail(e)
+    if source != "eastmoney_clist":
+        # 腾讯来源没有行业/上市日：显式说明，避免下游把 None 当"该股无行业"
+        logger.warning("universe 走腾讯兜底：industry/list_date 不可用")
 
     cutoff = None
     if exclude_new_days and exclude_new_days > 0:
@@ -2334,8 +2430,11 @@ def get_a_trade_universe(exclude_st: bool = True, exclude_new_days: int = 60,
     universe.sort(key=lambda x: x["amount_wan"], reverse=True)
     out = universe[:int(limit)] if limit and int(limit) > 0 else universe
     result = _json.dumps({
+        "source": source,
         "scanned": len(rows), "passed": len(universe), "returned": len(out),
         "excluded": excluded,
+        "notes": [] if source == "eastmoney_clist" else [
+            "source=tencent_qt：industry 与 list_date 不可用（该源不提供），mktcap 为总市值"],
         "filters": {"exclude_st": exclude_st, "exclude_new_days": exclude_new_days,
                     "include_bj": include_bj, "min_amount_wan": min_amount_wan,
                     "exclude_suspended": exclude_suspended},
