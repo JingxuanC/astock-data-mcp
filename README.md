@@ -1,6 +1,6 @@
 # astock-data-mcp
 
-A 股全维数据 MCP 服务：**45 个工具 / 6 个业务域**，覆盖行情、资金流、涨停打板、龙虎榜、热榜舆情、财报 F10、研报告警、期权、公司行动。数据源全部直连（东方财富 / 新浪 / 腾讯 / 同花顺 / mootdx 通达信 / 巨潮资讯），**零 akshare 依赖**。
+A 股全维数据 MCP 服务：**47 个工具 / 6 个业务域**，覆盖行情、资金流、涨停打板、龙虎榜、热榜舆情、财报 F10、研报告警、期权、公司行动。数据源全部直连（东方财富 / 新浪 / 腾讯 / 同花顺 / mootdx 通达信 / 巨潮资讯），**零 akshare 依赖**。
 
 > 从 [Athena](https://github.com/JingxuanC) 多 Agent 量化交易系统的 py-sidecar 抽取的 A 股数据子集，独立成仓开源。
 
@@ -17,6 +17,8 @@ A 股全维数据 MCP 服务：**45 个工具 / 6 个业务域**，覆盖行情�
 | `get_a_stock_info` | 基础信息：行业、总/流通股本、市值、上市日期（东财） |
 | `get_a_search` | 按名称/代码搜索股票 |
 | `get_a_time_info` | 当前时间 + 最近交易日 |
+| `get_a_trade_universe` | **可交易域**：全市场按 total 分页拉取，剔除 ST/退市、停牌、次新（默认 60 天）、可选北交所与成交额下限；返回逐项淘汰计数（可审计） |
+| `get_a_market_snapshot` | **全市场宽度**：涨跌家数、涨跌幅分布桶、中位数/均值、总成交额（冷调用约 1 分钟，之后走缓存） |
 | `get_a_fund_flow_120d` | 近 120 交易日资金流（主力/超大/大/中/小单） |
 | `get_a_fund_flow_minute` | 盘中分钟级资金流（klt=1/5/15/30/60） |
 | `get_a_north_flow` | 北向资金日度净流入（沪深港通） |
@@ -92,7 +94,7 @@ pip install -r requirements.txt
 ```bash
 python3 server.py --port 50052
 # GET  /health      健康检查
-# GET  /tools       全部 45 个工具 schema
+# GET  /tools       全部 47 个工具 schema
 # POST /call-tool   {"tool": "get_a_realtime", "arguments": {"symbol": "600519"}}
 # POST /mcp         MCP JSON-RPC（initialize / tools/list / tools/call）
 ```
@@ -112,7 +114,7 @@ python3 mcp_domain_server.py --domain options   --port 50059
 
 ## Docker 部署
 
-无需本地 Python 环境，一条命令起服务（默认整跑模式，45 个工具）：
+无需本地 Python 环境，一条命令起服务（默认整跑模式，47 个工具）：
 
 ```bash
 docker compose up -d        # 构建镜像 + 启动容器（首次构建约 1-3 分钟）
@@ -124,7 +126,7 @@ docker compose logs -f      # 跟踪日志
 
 ```bash
 curl http://127.0.0.1:50052/health
-curl http://127.0.0.1:50052/tools   # 应返回 45 个工具
+curl http://127.0.0.1:50052/tools   # 应返回 47 个工具
 curl -X POST http://127.0.0.1:50052/call-tool \
   -H 'Content-Type: application/json' \
   -d '{"tool": "get_a_realtime", "arguments": {"symbol": "sh600519"}}'

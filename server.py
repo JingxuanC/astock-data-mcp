@@ -2104,6 +2104,247 @@ def research_reports(codes: list) -> str:
     return json.dumps(fetch_research_reports(codes), ensure_ascii=False, default=str)
 
 
+# ═══════════════════════════════════════════════
+# 全市场截面（universe / breadth）
+# ═══════════════════════════════════════════════
+#
+# 教训（2026-09）：东财 clist 会**静默截断分页**——请求 pz=500 实际只回 100 行，
+# 接口异常时甚至只回 2 行。旧写法 `if len(diff) < pz: break` 把"被截断的短页"
+# 当成"列表到底了"，于是"全市场"退化成 100 只甚至 2 只，而这种退化**不抛异常**，
+# 下游（日线增量更新）照常把结果当全市场用，直接产出错误数据。
+# 因此这里统一以响应里的 total 为终止条件，并对退化显式报错：宁可报错，
+# 也绝不返回一个静默截断的 universe。
+
+_EM_CLIST_URL = "https://push2.eastmoney.com/api/qt/clist/get"
+_FS_SH_SZ = "m:1+t:2,m:1+t:23,m:0+t:6,m:0+t:80"   # 沪主板+科创, 深主板+创业
+_FS_BJ = "m:0+t:81+s:2048"                          # 北交所
+_UNIVERSE_FLOOR = 1000                              # 全市场量级下限（低于此判为接口异常）
+
+
+class ClistDegraded(RuntimeError):
+    """东财 clist 返回的数据不完整（分页被截断 / 限流 / 异常短），拒绝当全市场使用。"""
+
+
+def _clist_page(fs: str, fields: str, page: int, page_size: int = 100) -> tuple:
+    """取一页 → (rows, total)。total 由接口给出，是翻页的唯一权威依据。"""
+    r = em_get(_EM_CLIST_URL, params={
+        "pn": str(page), "pz": str(page_size), "po": "1", "np": "1",
+        "fltt": "2", "invt": "2", "fs": fs, "fields": fields,
+    }, headers={"User-Agent": _UA}, timeout=20)
+    data = (r.json() or {}).get("data") or {}
+    return (data.get("diff") or []), int(data.get("total") or 0)
+
+
+def em_clist_all(fs: str, fields: str, page_size: int = 100, max_pages: int = 90,
+                 min_expected: int = None) -> list:
+    """按 total 翻完全部页；任何不完整都抛 ClistDegraded（绝不静默返回短列表）。
+
+    min_expected 走**晚绑定**读取 _UNIVERSE_FLOOR：写成默认值 `=_UNIVERSE_FLOOR`
+    会在定义时求值，此后改模块常量（或按环境调阈值、测试里放宽）都不生效。
+    """
+    if min_expected is None:
+        min_expected = _UNIVERSE_FLOOR
+    rows: list = []
+    total = 0
+    for page in range(1, max_pages + 1):
+        diff, total = _clist_page(fs, fields, page, page_size)
+        total = max(total, 0)
+        if not diff:
+            break
+        rows.extend(diff)
+        if total and len(rows) >= total:
+            break
+        if len(diff) < page_size:
+            break  # 不满一页 = 正常到底
+    if total and len(rows) < total:
+        raise ClistDegraded(
+            f"clist 只取到 {len(rows)}/{total} 条：分页被截断或限流，拒绝当全市场使用")
+    if len(rows) < min_expected:
+        raise ClistDegraded(
+            f"clist 仅返回 {len(rows)} 条（< {min_expected}）：接口异常，拒绝当全市场使用")
+    return rows
+
+
+def _symbol_of(code: str, market) -> str:
+    """东财 f12/f13 → 规范符号 sh600519 / sz000001 / bj430047。"""
+    if _is_bj(code, market):
+        mkt = "bj"
+    else:
+        mkt = "sh" if str(market) == "1" else "sz"
+    norm = normalize_symbol(mkt + str(code))
+    return (norm[0] + norm[1]) if norm else str(code)
+
+
+def _is_bj(code: str, market) -> bool:
+    """北交所号段 43/83/87/88/920；深市只有 00/30 开头，不会误判。"""
+    return str(market) == "0" and str(code)[:1] in ("4", "8", "9")
+
+
+def _num(v, default=None):
+    """东财空值是 '-' 字符串；统一转 float，转不了给 default。"""
+    if v is None or v == "-" or v == "":
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+@tool("get_a_market_snapshot",
+      "Whole-market breadth snapshot (全市场涨跌家数/分布). Pages the full A-share list "
+      "(~5500 stocks) and returns up/down/flat counts, pct-change buckets, median/mean "
+      "change, total turnover. Cold call takes ~1 min (eastmoney throttles to 1 req/s) "
+      "then cached. Raises instead of returning a truncated market if the list source "
+      "is degraded. Returns object: total, up, down, flat, median_pct, mean_pct, "
+      "amount_yi, buckets{...}, limit_up_like, limit_down_like.",
+      {"include_bj": {"type": "boolean", "description": "Include Beijing Stock Exchange (default false)"}})
+def get_a_market_snapshot(include_bj: bool = False) -> str:
+    import json as _json
+    cached = _cache_get("get_a_market_snapshot", str(include_bj))
+    if cached:
+        return cached
+    fs = _FS_SH_SZ + ("," + _FS_BJ if include_bj else "")
+    try:
+        rows = em_clist_all(fs, "f3,f12,f14,f6")
+    except ClistDegraded as e:
+        return fail(str(e), code="degraded_source",
+                    hint="东财 clist 被截断或限流；稍后重试，或改用 get_a_limit_up_pool / get_a_indices")
+    except Exception as e:
+        return fail(e)
+    pcts, amount = [], 0.0
+    for it in rows:
+        p = _num(it.get("f3"))
+        if p is None:
+            continue
+        pcts.append(p)
+        amount += _num(it.get("f6"), 0.0) or 0.0
+    if not pcts:
+        return '{"total":0,"up":0,"down":0,"flat":0,"note":"no quotes in snapshot"}'
+    pcts.sort()
+    n = len(pcts)
+    up = sum(1 for p in pcts if p > 0)
+    down = sum(1 for p in pcts if p < 0)
+    edges = ["跌停附近", "跌5%以上", "跌2-5%", "跌0-2%",
+             "涨0-2%", "涨2-5%", "涨5-9.5%", "涨停附近(≥9.5%)"]
+    buckets = {name: 0 for name in edges}
+    for p in pcts:
+        if p <= -9.5:
+            buckets["跌停附近"] += 1
+        elif p <= -5:
+            buckets["跌5%以上"] += 1
+        elif p < 0:
+            buckets["跌0-2%" if p > -2 else "跌2-5%"] += 1
+        elif p < 2:
+            buckets["涨0-2%"] += 1
+        elif p < 5:
+            buckets["涨2-5%"] += 1
+        elif p < 9.5:
+            buckets["涨5-9.5%"] += 1
+        else:
+            buckets["涨停附近(≥9.5%)"] += 1
+    result = _json.dumps({
+        "scanned": len(rows), "total": n, "up": up, "down": down, "flat": n - up - down,
+        "median_pct": round(pcts[n // 2], 3), "mean_pct": round(sum(pcts) / n, 3),
+        "amount_yi": round(amount / 1e8, 1),
+        "limit_up_like": sum(1 for p in pcts if p >= 9.5),
+        "limit_down_like": sum(1 for p in pcts if p <= -9.5),
+        "buckets": buckets,
+        "note": "total 是有有效涨跌幅的只数（停牌股无涨跌幅不进统计）；"
+                "limit_up_like 是 |pct|>=9.5% 的计数（含创业/科创 20% 涨停），"
+                "精确涨停家数用 get_a_limit_up_pool",
+    }, ensure_ascii=False)
+    if not _is_empty_result(result):
+        _cache_set("get_a_market_snapshot", result, str(include_bj))
+    return result
+
+
+@tool("get_a_trade_universe",
+      "Investable A-share universe for daily screening (可交易域). Applies the exclusions "
+      "that matter before ranking: ST/退市 risk (name contains ST/退), suspended (no quote), "
+      "recent IPOs (default <60 trading-ish days since listing), optionally Beijing exchange "
+      "and a min turnover floor. Returns every exclusion count so the filter is auditable, "
+      "plus universe[] with symbol/name/price/change/amount/mktcap/industry/list_date. "
+      "Raises instead of returning a truncated universe if the list source is degraded.",
+      {"exclude_st": {"type": "boolean", "description": "Drop ST/*ST/退市 (default true)"},
+       "exclude_new_days": {"type": "integer", "description": "Drop stocks listed less than N days ago (default 60; 0=off)"},
+       "include_bj": {"type": "boolean", "description": "Include Beijing Stock Exchange (default false)"},
+       "min_amount_wan": {"type": "number", "description": "Min turnover in 万CNY (default 0)"},
+       "exclude_suspended": {"type": "boolean", "description": "Drop stocks with no valid quote (default true)"},
+       "limit": {"type": "integer", "description": "Max rows to return (0=all)"}})
+def get_a_trade_universe(exclude_st: bool = True, exclude_new_days: int = 60,
+                         include_bj: bool = False, min_amount_wan: float = 0.0,
+                         exclude_suspended: bool = True, limit: int = 0) -> str:
+    import json as _json
+    import datetime as _dt
+    cache_args = (str(exclude_st), str(exclude_new_days), str(include_bj),
+                  str(min_amount_wan), str(exclude_suspended), str(limit))
+    cached = _cache_get("get_a_trade_universe", *cache_args)
+    if cached:
+        return cached
+    fs = _FS_SH_SZ + ("," + _FS_BJ if include_bj else "")
+    try:
+        rows = em_clist_all(fs, "f12,f13,f14,f2,f3,f6,f8,f20,f21,f26,f100")
+    except ClistDegraded as e:
+        return fail(str(e), code="degraded_source",
+                    hint="东财 clist 被截断或限流；稍后重试。绝不返回静默截断的 universe")
+    except Exception as e:
+        return fail(e)
+
+    cutoff = None
+    if exclude_new_days and exclude_new_days > 0:
+        cutoff = (_dt.date.today() - _dt.timedelta(days=int(exclude_new_days))).strftime("%Y%m%d")
+    excluded = {"st": 0, "suspended": 0, "new_listing": 0, "bj": 0, "low_amount": 0}
+    universe = []
+    for it in rows:
+        code = str(it.get("f12") or "")
+        market = it.get("f13")
+        name = str(it.get("f14") or "")
+        if _is_bj(code, market) and not include_bj:
+            excluded["bj"] += 1
+            continue
+        if exclude_st and ("ST" in name.upper() or "退" in name):
+            excluded["st"] += 1
+            continue
+        price = _num(it.get("f2"))
+        if exclude_suspended and (price is None or price <= 0):
+            excluded["suspended"] += 1
+            continue
+        list_date = str(it.get("f26") or "")
+        if cutoff and list_date and list_date > cutoff:
+            excluded["new_listing"] += 1
+            continue
+        amount = _num(it.get("f6"), 0.0) or 0.0
+        if min_amount_wan and amount / 1e4 < min_amount_wan:
+            excluded["low_amount"] += 1
+            continue
+        mktcap, float_cap = _num(it.get("f20")), _num(it.get("f21"))
+        universe.append({
+            "symbol": _symbol_of(code, market),
+            "code": code,
+            "name": name,
+            "price": price,
+            "change_pct": _num(it.get("f3")),
+            "amount_wan": round(amount / 1e4, 1),
+            "turnover_pct": _num(it.get("f8")),
+            "mktcap_yi": round(mktcap / 1e8, 2) if mktcap else None,
+            "float_mktcap_yi": round(float_cap / 1e8, 2) if float_cap else None,
+            "industry": it.get("f100") or "",
+            "list_date": list_date or None,
+        })
+    universe.sort(key=lambda x: x["amount_wan"], reverse=True)
+    out = universe[:int(limit)] if limit and int(limit) > 0 else universe
+    result = _json.dumps({
+        "scanned": len(rows), "passed": len(universe), "returned": len(out),
+        "excluded": excluded,
+        "filters": {"exclude_st": exclude_st, "exclude_new_days": exclude_new_days,
+                    "include_bj": include_bj, "min_amount_wan": min_amount_wan,
+                    "exclude_suspended": exclude_suspended},
+        "universe": out,
+    }, ensure_ascii=False)
+    if not _is_empty_result(result):
+        _cache_set("get_a_trade_universe", result, *cache_args)
+    return result
+
 
 # ═══════════════════════════════════════════════
 # HTTP server (unified data tools)
