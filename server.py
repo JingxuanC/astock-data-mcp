@@ -39,6 +39,30 @@ from typing import Any, Optional
 from research_report import fetch_research_reports
 from mcp_gateway import METRICS, LicenseStore, QuotaExceeded
 
+# ── 公共原语：mcp-common 是唯一真源 ─────────────────────────────
+# 本文件在仓库里的 mcp_common.py 副本由 mcp-common/sync.py 生成，
+# 请勿直接编辑；要改 fail()/类型强制/代码日期归一化，改 canonical 后重新 sync。
+from mcp_common import (
+    bare_code,
+    coerce_args,
+    date_arg,
+    date_fail,
+    eastmoney_secid,
+    fail,
+    is_empty_result as _is_empty_result,
+    normalize_cn_symbol as normalize_symbol,
+    normalize_date,
+    symbol_fail,
+    SYMBOL_HINT,
+    tencent_symbol,
+)
+
+
+def coerce_tool_args(tool_name, args):
+    """调用 handler 前做轻量类型强制（绑定本服务注册表）。→ (args, None) 或 (None, fail_json)。"""
+    return coerce_args(HANDLERS, tool_name, args)
+
+
 # ── Lazy imports for A-share extensions ──
 _requests = None
 _pd = None
@@ -194,44 +218,6 @@ def _cache_get(tool_name: str, *args) -> Optional[Any]:
     return None
 
 
-# 只描述"这层结构本身"的元数据键：它们的存在不证明拿到了业务数据
-_META_KEYS = {"date", "total", "total_records", "count", "category", "code",
-              "symbol", "source", "note", "market", "ts"}
-
-
-def _is_empty_result(value: Any) -> bool:
-    """空结果判定：None / 空容器 / 空 JSON 串（[]、{}）/ 全空字段都算空。
-
-    上游限流或空响应常返回 []/{}，若照常写缓存，TTL 内所有调用方都会拿到
-    假"无数据"。注意 json.dumps([]) == "[]" 是**非空字符串**，所以不能只
-    判断字符串真值，必须反解 JSON 再判空。
-    """
-    if value is None:
-        return True
-    if isinstance(value, str):
-        s = value.strip()
-        if not s or s in ("[]", "{}", "null", "None"):
-            return True
-        try:
-            return _is_empty_result(json.loads(s))
-        except (ValueError, TypeError):
-            return False  # 非 JSON 文本（如纯文本行情）视为有内容
-    if isinstance(value, bool):
-        return not value
-    if isinstance(value, (int, float)):
-        return value == 0
-    if isinstance(value, (list, tuple, set)):
-        return len(value) == 0 or all(_is_empty_result(v) for v in value)
-    if isinstance(value, dict):
-        if not value:
-            return True
-        data_vals = [v for k, v in value.items() if k not in _META_KEYS]
-        if not data_vals:
-            return False  # 只有元数据字段，不足以判定为空
-        return all(_is_empty_result(v) for v in data_vals)
-    return False
-
-
 def _cache_set(tool_name: str, value: Any, *args) -> None:
     # 空结果不缓存（调用点也各自加了守卫，这里是最后一道防线）
     if _is_empty_result(value):
@@ -274,298 +260,6 @@ def tool(name: str, description: str, properties: dict, required: Optional[list]
         HANDLERS[name] = fn
         return fn
     return deco
-
-
-def fail(msg, code="error", hint=""):
-    """统一错误出口：保证合法 JSON，并让 LLM 能据此纠正。
-
-    旧写法用 %s 直接拼异常字符串、未做转义，异常信息里带引号时
-    （例如 KeyError:'data'）会产出非法 JSON，客户端解析直接失败。
-    """
-    payload = {"error": str(msg), "code": code}
-    if hint:
-        payload["hint"] = hint
-    return json.dumps(payload, ensure_ascii=False)
-
-
-# ═══════════════════════════════════════════════════════════════
-# 代码 / 日期 归一化 + 参数类型强制
-#
-# 背景：调用方是 LLM Agent（背后是不会写提示词的散户），同一个业务概念
-# 在旧实现里有多套互不兼容的写法/判断，且遇到不认识的值一律静默返回 []，
-# LLM 分不清"代码写错了"和"确实没数据"。下面这几个函数是唯一真源，
-# 全仓 45 个工具统一走它们；非法输入一律返回可操作的 JSON 错误。
-# ═══════════════════════════════════════════════════════════════
-
-# 代码 → 市场 的识别规则表（唯一真源；前缀匹配，2 位优先于 1 位）
-#   sh 沪市: 60x 主板 / 68x 科创板 / 90x B股 / 11x 可转债 / 5xxxxx ETF·LOF
-#   sz 深市: 00x 主板 / 30x 创业板 / 12x 可转债 / 15x·16x·18x 基金 / 20x B股
-#   bj 北交所: 43x / 83x / 87x / 92x
-_SYMBOL_PREFIX_MARKET = (
-    ("60", "sh"), ("68", "sh"), ("90", "sh"), ("11", "sh"), ("5", "sh"),
-    ("00", "sz"), ("30", "sz"), ("12", "sz"), ("15", "sz"),
-    ("16", "sz"), ("18", "sz"), ("20", "sz"),
-    ("43", "bj"), ("83", "bj"), ("87", "bj"), ("92", "bj"),
-)
-# 显式市场标记（前缀或后缀）→ 市场；SS=上交所老写法，BSE/BJS=北交所
-_SYMBOL_MARKET_TAG = {
-    "sh": "sh", "ss": "sh", "shse": "sh",
-    "sz": "sz", "szse": "sz",
-    "bj": "bj", "bse": "bj", "bjs": "bj",
-}
-# 600519 / sh600519 / SH600519 / 600519.SH / 600519.SS / sz000001 / 430047.BJ
-_SYMBOL_RE = re.compile(
-    r"^(?:(sh|sz|bj)[.\-_]?)?(\d{6})(?:[.\-_]?(sh|ss|shse|sz|szse|bj|bse|bjs))?$",
-    re.IGNORECASE)
-
-_SYMBOL_HINT = ("支持 600519 / sh600519 / SH600519 / 600519.SH 等写法；"
-                "沪 60/68/5xxxxx/90x、深 00/30/12x/15x/16x/18x/20x、北 43/83/87/92")
-
-
-def normalize_symbol(s):
-    """任意常见写法的 A 股代码 → 规范 (market, code)，无法识别返回 None。
-
-    显式市场标记（sh600519 / 600519.SH）优先于按号段推断，这样
-    sh000001（上证指数）与 sz000001（平安银行）都能正确区分。
-    """
-    if s is None:
-        return None
-    raw = str(s).strip()
-    if not raw:
-        return None
-    m = _SYMBOL_RE.match(raw)
-    if not m:
-        return None
-    pre_tag, code, suf_tag = m.group(1), m.group(2), m.group(3)
-    tag = (pre_tag or suf_tag or "").lower()
-    if tag:
-        market = _SYMBOL_MARKET_TAG.get(tag)
-        if market is None:
-            return None
-        return (market, code)
-    for prefix, market in _SYMBOL_PREFIX_MARKET:
-        if code.startswith(prefix):
-            return (market, code)
-    return None
-
-
-def symbol_fail(s):
-    """无法识别代码时的可操作错误（禁止静默返回 []）。"""
-    return fail("无法识别股票代码 '%s'" % (s,), code="invalid_symbol", hint=_SYMBOL_HINT)
-
-
-def bare_code(s):
-    """→ 6 位裸代码（东财 datacenter / 巨潮 / 同花顺等只要裸代码的接口用），失败返回 None。"""
-    norm = normalize_symbol(s)
-    return norm[1] if norm else None
-
-
-def tencent_symbol(s):
-    """→ 腾讯行情写法 sh600519 / sz000001 / bj430047，失败返回 None。"""
-    norm = normalize_symbol(s)
-    return (norm[0] + norm[1]) if norm else None
-
-
-def eastmoney_secid(s):
-    """→ 东财 secid（1.=沪，0.=深/北），失败返回 None。"""
-    norm = normalize_symbol(s)
-    if not norm:
-        return None
-    return ("1." if norm[0] == "sh" else "0.") + norm[1]
-
-
-# ── 日期：YYYYMMDD / YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD 全兼容 ──
-_DATE_FORMATS = ("%Y-%m-%d", "%Y%m%d", "%Y/%m/%d", "%Y.%m.%d")
-_DATE_HINT = "支持 20260626 / 2026-06-26 / 2026/06/26 三种写法"
-
-
-def normalize_date(value, fmt="%Y-%m-%d"):
-    """归一化日期字符串；None/空 → None；无法识别 → ValueError（可操作文案）。"""
-    if value is None:
-        return None
-    s = str(value).strip()
-    if not s:
-        return None
-    for f in _DATE_FORMATS:
-        try:
-            return datetime.strptime(s, f).strftime(fmt)
-        except ValueError:
-            continue
-    raise ValueError("无法识别日期 '%s'" % (value,))
-
-
-def date_fail(value):
-    """日期非法的可操作错误。"""
-    return fail("无法识别日期 '%s'" % (value,), code="invalid_date", hint=_DATE_HINT)
-
-
-def date_arg(value, fmt="%Y-%m-%d", default_today=False):
-    """→ (归一化日期, None) 或 (None, fail_json)。
-
-    default_today=True 时 None/空 取今天（与 get_a_hot_reason /
-    get_a_daily_dragon_tiger 的历史行为一致）。
-    """
-    try:
-        out = normalize_date(value, fmt)
-    except ValueError:
-        return None, date_fail(value)
-    if out is None and default_today:
-        out = datetime.now().strftime(fmt)
-    return out, None
-
-
-def _ann_type(ann):
-    """把参数注解解析成真实类型（global-data-mcp 用 from __future__ import
-    annotations，注解是字符串；astock 仓是真实类型对象）。"""
-    if ann is inspect.Parameter.empty or ann is None:
-        return None
-    if isinstance(ann, str):
-        return {"int": int, "float": float, "bool": bool, "str": str,
-                "list": list, "dict": dict}.get(ann.strip())
-    return ann
-
-
-_ANN_NAME = {int: "integer", float: "number", bool: "boolean",
-             str: "string", list: "array", dict: "object"}
-_BOOL_TRUE = {"true", "1", "yes", "y", "on"}
-_BOOL_FALSE = {"false", "0", "no", "n", "off"}
-
-
-def _arg_fail(name, expected, value):
-    return fail("参数 '%s' 类型错误：期望 %s，实际收到 %r（%s）"
-                % (name, expected, value, type(value).__name__),
-                code="invalid_argument",
-                hint="参数 '%s' 请传 %s 类型，例如 %s=%s"
-                     % (name, expected, name,
-                        {"integer": "5", "number": "5.0", "boolean": "true",
-                         "string": "'600519'", "array": "['600519']",
-                         "object": "{}"}.get(expected, "值")))
-
-
-def coerce_tool_args(tool_name, args):
-    """调用 handler 前做轻量类型强制。→ (新参数 dict, None) 或 (None, fail_json)。
-
-    散户/LLM 常把数字传成字符串（days="5"）或把代码传成数字（symbol=600519），
-    旧实现直接解包 → 在 min(max(days,1),60) 抛
-    "'>' not supported between instances of 'str' and 'int'"，LLM 无法据此纠正。
-    这里按 handler 签名注解转换；转不了就返回点明参数名/期望类型/实际值的错误。
-    """
-    fn = HANDLERS.get(tool_name)
-    if fn is None or not isinstance(args, dict):
-        return args, None
-    try:
-        sig = inspect.signature(fn)
-    except (TypeError, ValueError):
-        return args, None
-    params = sig.parameters
-    out = dict(args)
-    # 未声明的参数：明确报错（旧实现直接解包 → TypeError: unexpected keyword）
-    if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        unknown = [k for k in out if k not in params]
-        if unknown:
-            return None, fail(
-                "工具 %s 不支持参数 %s" % (tool_name, ", ".join("'%s'" % u for u in unknown)),
-                code="unknown_argument",
-                hint="支持的参数: " + (", ".join(params) or "（无）"))
-    for name, val in list(out.items()):
-        if name not in params:
-            continue
-        p = params[name]
-        if p.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL):
-            continue
-        ann = _ann_type(p.annotation)
-        if ann is None:
-            continue
-        if val is None:
-            # 显式传 null：有默认值就当没传（旧实现会崩在 min(max(days,1),60)）
-            if p.default is not inspect.Parameter.empty:
-                out.pop(name, None)
-            else:
-                return None, fail("参数 '%s' 不能为 null" % name, code="invalid_argument",
-                                  hint="参数 '%s' 是必填项，请提供 %s 类型的值"
-                                       % (name, _ANN_NAME.get(ann, "正确")))
-            continue
-        if ann is int:
-            if isinstance(val, bool):
-                out[name] = int(val)
-            elif isinstance(val, int):
-                continue
-            elif isinstance(val, float):
-                if float(val).is_integer():
-                    out[name] = int(val)
-                else:
-                    return None, _arg_fail(name, "integer", val)
-            elif isinstance(val, str):
-                try:
-                    out[name] = int(val.strip())
-                except ValueError:
-                    try:
-                        f = float(val.strip())
-                    except ValueError:
-                        return None, _arg_fail(name, "integer", val)
-                    if not f.is_integer():
-                        return None, _arg_fail(name, "integer", val)
-                    out[name] = int(f)
-            else:
-                return None, _arg_fail(name, "integer", val)
-        elif ann is float:
-            if isinstance(val, bool):
-                out[name] = float(val)
-            elif isinstance(val, (int, float)):
-                out[name] = float(val)
-            elif isinstance(val, str):
-                try:
-                    out[name] = float(val.strip())
-                except ValueError:
-                    return None, _arg_fail(name, "number", val)
-            else:
-                return None, _arg_fail(name, "number", val)
-        elif ann is bool:
-            if isinstance(val, bool):
-                continue
-            if isinstance(val, int) and val in (0, 1):
-                out[name] = bool(val)
-            elif isinstance(val, str) and val.strip().lower() in _BOOL_TRUE | _BOOL_FALSE:
-                out[name] = val.strip().lower() in _BOOL_TRUE
-            else:
-                return None, _arg_fail(name, "boolean", val)
-        elif ann is str:
-            if isinstance(val, str):
-                continue
-            if isinstance(val, bool):
-                out[name] = str(val)
-            elif isinstance(val, int):
-                out[name] = str(val)
-            elif isinstance(val, float):
-                # JSON 里 600519.0 会被解析成 float，还原成 "600519" 而不是 "600519.0"
-                out[name] = str(int(val)) if val.is_integer() else str(val)
-            else:
-                return None, _arg_fail(name, "string", val)
-        elif ann is list:
-            if isinstance(val, list):
-                continue
-            if isinstance(val, str):
-                try:
-                    parsed = json.loads(val)
-                except (ValueError, TypeError):
-                    parsed = [x.strip() for x in val.split(",") if x.strip()]
-                if isinstance(parsed, list):
-                    out[name] = parsed
-                    continue
-            return None, _arg_fail(name, "array", val)
-        elif ann is dict:
-            if isinstance(val, dict):
-                continue
-            if isinstance(val, str):
-                try:
-                    parsed = json.loads(val)
-                except (ValueError, TypeError):
-                    parsed = None
-                if isinstance(parsed, dict):
-                    out[name] = parsed
-                    continue
-            return None, _arg_fail(name, "object", val)
-    return out, None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -618,7 +312,7 @@ def _sina_fetch_klines(symbol: str, count: int) -> list[dict]:
     # 新浪只认 sh/sz 前缀，且只支持沪深；统一走 normalize_symbol，不再自己判号段
     sym = tencent_symbol(symbol)
     if sym is None:
-        raise ValueError("无法识别股票代码 '%s'（%s）" % (symbol, _SYMBOL_HINT))
+        raise ValueError("无法识别股票代码 '%s'（%s）" % (symbol, SYMBOL_HINT))
     symbol = sym
     url = ("http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
            f"CN_MarketData.getKLineData?symbol={symbol}&scale=240&ma=no&datalen={count}")
@@ -639,7 +333,7 @@ def get_a_realtime(symbol: str) -> str:
     import json as _json
     syms = [s.strip() for s in str(symbol).split(",") if s.strip()]
     if not syms:
-        return fail("symbol 不能为空", code="invalid_symbol", hint=_SYMBOL_HINT)
+        return fail("symbol 不能为空", code="invalid_symbol", hint=SYMBOL_HINT)
     full = []
     for s in syms:
         norm = normalize_symbol(s)
