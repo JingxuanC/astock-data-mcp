@@ -37,7 +37,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # 复用 sidecar 的工具注册表（HANDLERS: name→callable, TOOLS: name→ToolDef）
-from server import HANDLERS, TOOLS  # noqa: F401  — 副作用：注册全部工具
+from server import HANDLERS, TOOLS, coerce_tool_args  # noqa: F401  — 副作用：注册全部工具
 
 
 def _result_is_error(result) -> bool:
@@ -243,6 +243,14 @@ class DomainHandler(BaseHTTPRequestHandler):
                     self._send(200, {"jsonrpc": "2.0", "id": mid,
                                      "error": {"code": -32029, "message": str(e)}})
                     return
+            # 轻量类型强制：字符串数字（days="5"）先转换，转不了给可操作错误。
+            # 必须在入队/执行之前，否则 worker 里抛 TypeError 无法回给调用方。
+            tool_args, arg_err = coerce_tool_args(tool_name, tool_args)
+            if arg_err:
+                METRICS.inc_call(tool_name, "error")
+                self._send(200, {"jsonrpc": "2.0", "id": mid, "result": {
+                    "content": [{"type": "text", "text": arg_err}], "isError": True}})
+                return
             # 重负载 → 入队异步执行，返回 job_id 供轮询
             if is_async:
                 try:

@@ -16,9 +16,11 @@ astock-data-mcp — A股全维数据 MCP 服务（行情/资金流/打板/龙虎
   python3 mcp_domain_server.py --domain market --port 50056   # 分域 MCP（六域独立进程）
 """
 
+import inspect
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta
 try:
@@ -287,6 +289,286 @@ def fail(msg, code="error", hint=""):
 
 
 # ═══════════════════════════════════════════════════════════════
+# 代码 / 日期 归一化 + 参数类型强制
+#
+# 背景：调用方是 LLM Agent（背后是不会写提示词的散户），同一个业务概念
+# 在旧实现里有多套互不兼容的写法/判断，且遇到不认识的值一律静默返回 []，
+# LLM 分不清"代码写错了"和"确实没数据"。下面这几个函数是唯一真源，
+# 全仓 45 个工具统一走它们；非法输入一律返回可操作的 JSON 错误。
+# ═══════════════════════════════════════════════════════════════
+
+# 代码 → 市场 的识别规则表（唯一真源；前缀匹配，2 位优先于 1 位）
+#   sh 沪市: 60x 主板 / 68x 科创板 / 90x B股 / 11x 可转债 / 5xxxxx ETF·LOF
+#   sz 深市: 00x 主板 / 30x 创业板 / 12x 可转债 / 15x·16x·18x 基金 / 20x B股
+#   bj 北交所: 43x / 83x / 87x / 92x
+_SYMBOL_PREFIX_MARKET = (
+    ("60", "sh"), ("68", "sh"), ("90", "sh"), ("11", "sh"), ("5", "sh"),
+    ("00", "sz"), ("30", "sz"), ("12", "sz"), ("15", "sz"),
+    ("16", "sz"), ("18", "sz"), ("20", "sz"),
+    ("43", "bj"), ("83", "bj"), ("87", "bj"), ("92", "bj"),
+)
+# 显式市场标记（前缀或后缀）→ 市场；SS=上交所老写法，BSE/BJS=北交所
+_SYMBOL_MARKET_TAG = {
+    "sh": "sh", "ss": "sh", "shse": "sh",
+    "sz": "sz", "szse": "sz",
+    "bj": "bj", "bse": "bj", "bjs": "bj",
+}
+# 600519 / sh600519 / SH600519 / 600519.SH / 600519.SS / sz000001 / 430047.BJ
+_SYMBOL_RE = re.compile(
+    r"^(?:(sh|sz|bj)[.\-_]?)?(\d{6})(?:[.\-_]?(sh|ss|shse|sz|szse|bj|bse|bjs))?$",
+    re.IGNORECASE)
+
+_SYMBOL_HINT = ("支持 600519 / sh600519 / SH600519 / 600519.SH 等写法；"
+                "沪 60/68/5xxxxx/90x、深 00/30/12x/15x/16x/18x/20x、北 43/83/87/92")
+
+
+def normalize_symbol(s):
+    """任意常见写法的 A 股代码 → 规范 (market, code)，无法识别返回 None。
+
+    显式市场标记（sh600519 / 600519.SH）优先于按号段推断，这样
+    sh000001（上证指数）与 sz000001（平安银行）都能正确区分。
+    """
+    if s is None:
+        return None
+    raw = str(s).strip()
+    if not raw:
+        return None
+    m = _SYMBOL_RE.match(raw)
+    if not m:
+        return None
+    pre_tag, code, suf_tag = m.group(1), m.group(2), m.group(3)
+    tag = (pre_tag or suf_tag or "").lower()
+    if tag:
+        market = _SYMBOL_MARKET_TAG.get(tag)
+        if market is None:
+            return None
+        return (market, code)
+    for prefix, market in _SYMBOL_PREFIX_MARKET:
+        if code.startswith(prefix):
+            return (market, code)
+    return None
+
+
+def symbol_fail(s):
+    """无法识别代码时的可操作错误（禁止静默返回 []）。"""
+    return fail("无法识别股票代码 '%s'" % (s,), code="invalid_symbol", hint=_SYMBOL_HINT)
+
+
+def bare_code(s):
+    """→ 6 位裸代码（东财 datacenter / 巨潮 / 同花顺等只要裸代码的接口用），失败返回 None。"""
+    norm = normalize_symbol(s)
+    return norm[1] if norm else None
+
+
+def tencent_symbol(s):
+    """→ 腾讯行情写法 sh600519 / sz000001 / bj430047，失败返回 None。"""
+    norm = normalize_symbol(s)
+    return (norm[0] + norm[1]) if norm else None
+
+
+def eastmoney_secid(s):
+    """→ 东财 secid（1.=沪，0.=深/北），失败返回 None。"""
+    norm = normalize_symbol(s)
+    if not norm:
+        return None
+    return ("1." if norm[0] == "sh" else "0.") + norm[1]
+
+
+# ── 日期：YYYYMMDD / YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD 全兼容 ──
+_DATE_FORMATS = ("%Y-%m-%d", "%Y%m%d", "%Y/%m/%d", "%Y.%m.%d")
+_DATE_HINT = "支持 20260626 / 2026-06-26 / 2026/06/26 三种写法"
+
+
+def normalize_date(value, fmt="%Y-%m-%d"):
+    """归一化日期字符串；None/空 → None；无法识别 → ValueError（可操作文案）。"""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    for f in _DATE_FORMATS:
+        try:
+            return datetime.strptime(s, f).strftime(fmt)
+        except ValueError:
+            continue
+    raise ValueError("无法识别日期 '%s'" % (value,))
+
+
+def date_fail(value):
+    """日期非法的可操作错误。"""
+    return fail("无法识别日期 '%s'" % (value,), code="invalid_date", hint=_DATE_HINT)
+
+
+def date_arg(value, fmt="%Y-%m-%d", default_today=False):
+    """→ (归一化日期, None) 或 (None, fail_json)。
+
+    default_today=True 时 None/空 取今天（与 get_a_hot_reason /
+    get_a_daily_dragon_tiger 的历史行为一致）。
+    """
+    try:
+        out = normalize_date(value, fmt)
+    except ValueError:
+        return None, date_fail(value)
+    if out is None and default_today:
+        out = datetime.now().strftime(fmt)
+    return out, None
+
+
+def _ann_type(ann):
+    """把参数注解解析成真实类型（global-data-mcp 用 from __future__ import
+    annotations，注解是字符串；astock 仓是真实类型对象）。"""
+    if ann is inspect.Parameter.empty or ann is None:
+        return None
+    if isinstance(ann, str):
+        return {"int": int, "float": float, "bool": bool, "str": str,
+                "list": list, "dict": dict}.get(ann.strip())
+    return ann
+
+
+_ANN_NAME = {int: "integer", float: "number", bool: "boolean",
+             str: "string", list: "array", dict: "object"}
+_BOOL_TRUE = {"true", "1", "yes", "y", "on"}
+_BOOL_FALSE = {"false", "0", "no", "n", "off"}
+
+
+def _arg_fail(name, expected, value):
+    return fail("参数 '%s' 类型错误：期望 %s，实际收到 %r（%s）"
+                % (name, expected, value, type(value).__name__),
+                code="invalid_argument",
+                hint="参数 '%s' 请传 %s 类型，例如 %s=%s"
+                     % (name, expected, name,
+                        {"integer": "5", "number": "5.0", "boolean": "true",
+                         "string": "'600519'", "array": "['600519']",
+                         "object": "{}"}.get(expected, "值")))
+
+
+def coerce_tool_args(tool_name, args):
+    """调用 handler 前做轻量类型强制。→ (新参数 dict, None) 或 (None, fail_json)。
+
+    散户/LLM 常把数字传成字符串（days="5"）或把代码传成数字（symbol=600519），
+    旧实现直接解包 → 在 min(max(days,1),60) 抛
+    "'>' not supported between instances of 'str' and 'int'"，LLM 无法据此纠正。
+    这里按 handler 签名注解转换；转不了就返回点明参数名/期望类型/实际值的错误。
+    """
+    fn = HANDLERS.get(tool_name)
+    if fn is None or not isinstance(args, dict):
+        return args, None
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return args, None
+    params = sig.parameters
+    out = dict(args)
+    # 未声明的参数：明确报错（旧实现直接解包 → TypeError: unexpected keyword）
+    if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        unknown = [k for k in out if k not in params]
+        if unknown:
+            return None, fail(
+                "工具 %s 不支持参数 %s" % (tool_name, ", ".join("'%s'" % u for u in unknown)),
+                code="unknown_argument",
+                hint="支持的参数: " + (", ".join(params) or "（无）"))
+    for name, val in list(out.items()):
+        if name not in params:
+            continue
+        p = params[name]
+        if p.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL):
+            continue
+        ann = _ann_type(p.annotation)
+        if ann is None:
+            continue
+        if val is None:
+            # 显式传 null：有默认值就当没传（旧实现会崩在 min(max(days,1),60)）
+            if p.default is not inspect.Parameter.empty:
+                out.pop(name, None)
+            else:
+                return None, fail("参数 '%s' 不能为 null" % name, code="invalid_argument",
+                                  hint="参数 '%s' 是必填项，请提供 %s 类型的值"
+                                       % (name, _ANN_NAME.get(ann, "正确")))
+            continue
+        if ann is int:
+            if isinstance(val, bool):
+                out[name] = int(val)
+            elif isinstance(val, int):
+                continue
+            elif isinstance(val, float):
+                if float(val).is_integer():
+                    out[name] = int(val)
+                else:
+                    return None, _arg_fail(name, "integer", val)
+            elif isinstance(val, str):
+                try:
+                    out[name] = int(val.strip())
+                except ValueError:
+                    try:
+                        f = float(val.strip())
+                    except ValueError:
+                        return None, _arg_fail(name, "integer", val)
+                    if not f.is_integer():
+                        return None, _arg_fail(name, "integer", val)
+                    out[name] = int(f)
+            else:
+                return None, _arg_fail(name, "integer", val)
+        elif ann is float:
+            if isinstance(val, bool):
+                out[name] = float(val)
+            elif isinstance(val, (int, float)):
+                out[name] = float(val)
+            elif isinstance(val, str):
+                try:
+                    out[name] = float(val.strip())
+                except ValueError:
+                    return None, _arg_fail(name, "number", val)
+            else:
+                return None, _arg_fail(name, "number", val)
+        elif ann is bool:
+            if isinstance(val, bool):
+                continue
+            if isinstance(val, int) and val in (0, 1):
+                out[name] = bool(val)
+            elif isinstance(val, str) and val.strip().lower() in _BOOL_TRUE | _BOOL_FALSE:
+                out[name] = val.strip().lower() in _BOOL_TRUE
+            else:
+                return None, _arg_fail(name, "boolean", val)
+        elif ann is str:
+            if isinstance(val, str):
+                continue
+            if isinstance(val, bool):
+                out[name] = str(val)
+            elif isinstance(val, int):
+                out[name] = str(val)
+            elif isinstance(val, float):
+                # JSON 里 600519.0 会被解析成 float，还原成 "600519" 而不是 "600519.0"
+                out[name] = str(int(val)) if val.is_integer() else str(val)
+            else:
+                return None, _arg_fail(name, "string", val)
+        elif ann is list:
+            if isinstance(val, list):
+                continue
+            if isinstance(val, str):
+                try:
+                    parsed = json.loads(val)
+                except (ValueError, TypeError):
+                    parsed = [x.strip() for x in val.split(",") if x.strip()]
+                if isinstance(parsed, list):
+                    out[name] = parsed
+                    continue
+            return None, _arg_fail(name, "array", val)
+        elif ann is dict:
+            if isinstance(val, dict):
+                continue
+            if isinstance(val, str):
+                try:
+                    parsed = json.loads(val)
+                except (ValueError, TypeError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    out[name] = parsed
+                    continue
+            return None, _arg_fail(name, "object", val)
+    return out, None
+
+
+# ═══════════════════════════════════════════════════════════════
 # 14-16. A-share data (Tencent + Sina APIs, zero extra deps)
 # ═══════════════════════════════════════════════════════════════
 
@@ -333,8 +615,11 @@ def _tencent_fetch(symbols: list[str]) -> dict[str, dict]:
 
 def _sina_fetch_klines(symbol: str, count: int) -> list[dict]:
     import urllib.request, json as _json
-    if not symbol.startswith(("sh", "sz")):
-        symbol = ("sh" if symbol.startswith(("60","68","5","9")) else "sz") + symbol
+    # 新浪只认 sh/sz 前缀，且只支持沪深；统一走 normalize_symbol，不再自己判号段
+    sym = tencent_symbol(symbol)
+    if sym is None:
+        raise ValueError("无法识别股票代码 '%s'（%s）" % (symbol, _SYMBOL_HINT))
+    symbol = sym
     url = ("http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
            f"CN_MarketData.getKLineData?symbol={symbol}&scale=240&ma=no&datalen={count}")
     req = urllib.request.Request(url, headers={"User-Agent": "athena-mcp/1.0"})
@@ -345,45 +630,73 @@ def _sina_fetch_klines(symbol: str, count: int) -> list[dict]:
              "volume": int(float(r["volume"]))} for r in data] if isinstance(data, list) else []
 
 
-@tool("get_a_realtime", "A-share realtime quotes (Tencent). Batch: '600519,000001'",
+@tool("get_a_realtime", "A-share realtime quotes (Tencent). Batch: '600519,000001'. "
+      "Code formats accepted: 600519 / sh600519 / SH600519 / 600519.SH. "
+      "Returns per stock: symbol, name, price, change, pct_change, open, high, low, "
+      "prev_close, volume(股), amount(元), turnover(%), pe, pb, market_cap(元).",
       {"symbol": {"type": "string", "description": "Code or comma-separated codes"}}, required=['symbol'])
 def get_a_realtime(symbol: str) -> str:
     import json as _json
-    syms = [s.strip() for s in symbol.split(",") if s.strip()]
+    syms = [s.strip() for s in str(symbol).split(",") if s.strip()]
     if not syms:
-        return "[]"
-    full = [s if s.startswith(("sh","sz")) else ("sh"+s if s.startswith(("60","68","5","9")) else "sz"+s) for s in syms]
+        return fail("symbol 不能为空", code="invalid_symbol", hint=_SYMBOL_HINT)
+    full = []
+    for s in syms:
+        norm = normalize_symbol(s)
+        if norm is None:
+            return symbol_fail(s)
+        full.append(norm[0] + norm[1])
     try:
         data = _tencent_fetch(full)
+        if not data:
+            # 格式合法但上游无数据：明确区分于"代码写错"，不让 LLM 误判成没行情
+            return fail("未获取到 %s 的行情数据" % ",".join(syms), code="no_data",
+                        hint="代码可能不存在/已退市/停牌；请先用 get_a_search 确认代码")
         return _json.dumps(list(data.values()), ensure_ascii=False)
     except Exception as e:
         return fail(e)
 
 
-@tool("get_a_hist", "A-share daily K-line (Sina source).",
+@tool("get_a_hist", "A-share daily K-line (Sina source). Code formats accepted: "
+      "600519 / sh600519 / SH600519 / 600519.SH. start/end accept "
+      "2026-01-01 / 20260101 / 2026/01/01. "
+      "Returns array of bars: date, open, high, low, close, volume(股).",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"},
        "count": {"type": "integer", "description": "Number of bars (default 100)"},
        "start": {"type": "string", "description": "Start date YYYY-MM-DD (optional, range query)"},
        "end": {"type": "string", "description": "End date YYYY-MM-DD (optional, range query)"}}, required=['symbol'])
 def get_a_hist(symbol: str, count: int = 100, start: str = None, end: str = None) -> str:
     import json as _json
-    cached = _cache_get("get_a_hist", symbol, str(count), start or "", end or "")
+    t_sym = tencent_symbol(symbol)
+    if t_sym is None:
+        return symbol_fail(symbol)
+    start, _serr = date_arg(start)
+    if _serr:
+        return _serr
+    end, _eerr = date_arg(end)
+    if _eerr:
+        return _eerr
+    cached = _cache_get("get_a_hist", t_sym, str(count), start or "", end or "")
     if cached:
         return cached
     try:
         if start or end:
             # Range query: fetch the max Sina window, then filter by [start, end].
-            data = _sina_fetch_klines(symbol, 1023)
+            data = _sina_fetch_klines(t_sym, 1023)
             s, e = (start or "")[:10], (end or "")[:10]
             data = [d for d in data
                     if (not s or d["date"][:10] >= s) and (not e or d["date"][:10] <= e)]
         else:
-            data = _sina_fetch_klines(symbol, count)
+            data = _sina_fetch_klines(t_sym, count)
         result = _json.dumps(data, ensure_ascii=False)
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_hist", result, symbol, str(count), start or "", end or "")
+            _cache_set("get_a_hist", result, t_sym, str(count), start or "", end or "")
         return result
     except Exception as e:
+        msg = str(e)
+        if "HTTP Error" in msg or "456" in msg:
+            return fail("K 线上游接口不可用（%s，代码 %s）" % (msg, t_sym), code="upstream_error",
+                        hint="新浪 K 线接口限流/被墙；可稍后重试，或先用 get_a_realtime / get_a_intraday")
         return fail(e)
 
 
@@ -415,7 +728,8 @@ _A_INDEX_REVERSE = {
     "000905": "zz500", "899050": "bj50",
 }
 
-@tool("get_a_indices", "Major A-share index quotes. Use aliases: sh/sz/cy/kc50/hs300/sz50/zz500/bj50",
+@tool("get_a_indices", "Major A-share index quotes. Use aliases: sh/sz/cy/kc50/hs300/sz50/zz500/bj50. "
+      "Returns per index: alias, symbol, name, price, change, pct_change, open, high, low, volume, amount.",
       {"indices": {"type": "string",
                     "description": "Comma-separated index aliases (e.g. 'sh,sz,cy,hs300')"}})
 def get_a_indices(indices: str = "sh,sz,cy,hs300") -> str:
@@ -438,7 +752,9 @@ def get_a_indices(indices: str = "sh,sz,cy,hs300") -> str:
 # 18. Northbound flow (eastmoney push2)
 # ═══════════════════════════════════════════════════════════════
 
-@tool("get_a_north_flow", "Northbound capital flow (沪深港通). Returns daily net inflow in CNY.",
+@tool("get_a_north_flow", "Northbound capital flow (沪深港通). Returns daily net inflow in CNY. "
+      "Returns array (latest snapshot): date, north_sh(沪股通累计净买入,亿元), "
+      "north_sz(深股通累计净买入,亿元), north_total(合计,亿元).",
       {"days": {"type": "integer", "description": "Days to look back (default 5, max 60)"}})
 def get_a_north_flow(days: int = 5) -> str:
     import json as _json
@@ -474,7 +790,8 @@ def get_a_north_flow(days: int = 5) -> str:
 # 19. Stock search (Tencent smartbox)
 # ═══════════════════════════════════════════════════════════════
 
-@tool("get_a_search", "Search A-share stocks by name or code. Returns matching tickers.",
+@tool("get_a_search", "Search A-share stocks by name or code. Returns matching tickers. "
+      "Returns array: code, name, market(SH/SZ/BJ), type(如 GP-A / GP-A-KCB).",
       {"query": {"type": "string", "description": "Stock name or code (e.g. '茅台', '600519')"}}, required=['query'])
 def get_a_search(query: str) -> str:
     import json as _json, urllib.request, urllib.parse
@@ -512,24 +829,22 @@ def get_a_search(query: str) -> str:
 # 20. A-share financials (eastmoney datacenter)
 # ═══════════════════════════════════════════════════════════════
 
-@tool("get_a_financials", "A-share key financial metrics: PE, PB, market cap, EPS (derived from Tencent quote).",
+@tool("get_a_financials", "A-share key financial metrics: PE, PB, market cap, EPS (derived from Tencent quote). "
+      "Code formats accepted: 600519 / sh600519 / 600519.SH. "
+      "Returns array(1 item): name, price, pe_ttm, pe_static, pb, eps, bps, roe_approx, "
+      "market_cap_yi(亿元), float_market_cap_yi(亿元), turnover_pct, source, note.",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"},
        "annual": {"type": "boolean", "description": "True=annual, False=latest quarter (default: True)"}}, required=['symbol'])
 def get_a_financials(symbol: str, annual: bool = True) -> str:
     import json as _json
-    # Normalize symbol
-    sym = symbol.strip()
-    if len(sym) == 6 and not sym.startswith(("sh", "sz", "bj")):
-        if sym.startswith(("6", "9")):
-            sym = "sh" + sym
-        elif sym.startswith("8"):
-            sym = "bj" + sym
-        else:
-            sym = "sz" + sym
+    # Normalize symbol（统一走 normalize_symbol：sh/sz/bj + 600519.SH 等写法都收）
+    t_sym = tencent_symbol(symbol)
+    if t_sym is None:
+        return symbol_fail(symbol)
     try:
         # EastMoney datacenter securities API (RPT_DMSK_FN_MAININDICATOR) 已废弃
         # 改用腾讯行情数据派生基本财务指标
-        url = f"https://qt.gtimg.cn/q={sym}"
+        url = f"https://qt.gtimg.cn/q={t_sym}"
         r = _get_requests().get(url, timeout=10)
         raw = r.content.decode("gbk", errors="replace")
         # Parse Tencent quote: v_CODE="field1~field2~..."
@@ -586,8 +901,9 @@ def get_a_financials(symbol: str, annual: bool = True) -> str:
       {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"}}, required=['symbol'])
 def get_a_intraday(symbol: str) -> str:
     import json as _json, urllib.request
-    code = symbol if symbol.startswith(("sh","sz")) else (
-        "sh" + symbol if symbol.startswith(("60","68","5","9")) else "sz" + symbol)
+    code = tencent_symbol(symbol)
+    if code is None:
+        return symbol_fail(symbol)
     try:
         url = f"http://ifzq.gtimg.cn/appstock/app/minute/query?_var=min_data&code={code}"
         req = urllib.request.Request(url, headers={"User-Agent": "athena-mcp/1.0"})
@@ -624,12 +940,17 @@ PDF_TPL = "https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf"
 
 
 @tool("get_a_reports", "Get institutional research reports for an A-share stock (Eastmoney). "
-      "Returns title, org, date, rating, EPS forecasts, infoCode for PDF download.",
+      "Returns title, org, date, rating, EPS forecasts, infoCode for PDF download. "
+      "Returns array: title, orgSName(机构), publishDate, emRatingName(评级), "
+      "predictThisYearEps/predictNextYearEps, infoCode(PDF下载用).",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '688017')"},
        "max_pages": {"type": "integer", "description": "Max pages to fetch (default 5)"}}, required=['symbol'])
 def get_a_reports(symbol: str, max_pages: int = 5) -> str:
     import json as _json
-    cached = _cache_get("get_a_reports", symbol, str(max_pages))
+    code = bare_code(symbol)
+    if code is None:
+        return symbol_fail(symbol)
+    cached = _cache_get("get_a_reports", code, str(max_pages))
     if cached:
         return cached
     try:
@@ -640,7 +961,7 @@ def get_a_reports(symbol: str, max_pages: int = 5) -> str:
                 "rating": "*", "ratingChange": "*",
                 "beginTime": "2000-01-01", "endTime": "2030-01-01",
                 "pageNo": str(page), "fields": "", "qType": "0",
-                "orgCode": "", "code": symbol, "rcode": "",
+                "orgCode": "", "code": code, "rcode": "",
                 "p": str(page), "pageNum": str(page), "pageNumber": str(page),
             }
             r = em_get(REPORT_API, params=params,
@@ -654,7 +975,7 @@ def get_a_reports(symbol: str, max_pages: int = 5) -> str:
                 break
         result = _json.dumps(all_records, ensure_ascii=False)
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_reports", result, symbol, str(max_pages))
+            _cache_set("get_a_reports", result, code, str(max_pages))
         return result
     except Exception as e:
         return fail(e)
@@ -732,11 +1053,14 @@ def download_report_pdf(info_code: str, target_dir: str = "./reports") -> str:
 def get_a_eps_forecast(symbol: str) -> str:
     import json as _json
     from io import StringIO as _StringIO
-    cached = _cache_get("get_a_eps_forecast", symbol)
+    code = bare_code(symbol)
+    if code is None:
+        return symbol_fail(symbol)
+    cached = _cache_get("get_a_eps_forecast", code)
     if cached:
         return cached
     try:
-        url = f"https://basic.10jqka.com.cn/new/{symbol}/worth.html"
+        url = f"https://basic.10jqka.com.cn/new/{code}/worth.html"
         headers = {
             "User-Agent": _UA,
             "Referer": "https://basic.10jqka.com.cn/",
@@ -749,11 +1073,11 @@ def get_a_eps_forecast(symbol: str) -> str:
             if any("每股收益" in c or "均值" in c for c in cols):
                 result = df.to_json(orient="records", force_ascii=False)
                 if not _is_empty_result(result):  # 空结果不缓存
-                    _cache_set("get_a_eps_forecast", result, symbol)
+                    _cache_set("get_a_eps_forecast", result, code)
                 return result
         result = dfs[0].to_json(orient="records", force_ascii=False) if dfs else "[]"
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_eps_forecast", result, symbol)
+            _cache_set("get_a_eps_forecast", result, code)
         return result
     except Exception as e:
         return fail(e)
@@ -768,12 +1092,12 @@ def get_a_eps_forecast(symbol: str) -> str:
       {"date": {"type": "string", "description": "Date YYYY-MM-DD (default today)"}})
 def get_a_hot_reason(date: str = None) -> str:
     import json as _json
-    from datetime import date as _date
-    cached = _cache_get("get_a_hot_reason", date or "today")
+    date, derr = date_arg(date, "%Y-%m-%d", default_today=True)
+    if derr:
+        return derr
+    cached = _cache_get("get_a_hot_reason", date)
     if cached:
         return cached
-    if date is None:
-        date = _date.today().strftime("%Y-%m-%d")
     try:
         url = (f"http://zx.10jqka.com.cn/event/api/getharden/"
                f"date/{date}/orderby/date/orderway/desc/charset/GBK/")
@@ -785,7 +1109,7 @@ def get_a_hot_reason(date: str = None) -> str:
         rows = data.get("data") or []
         result = _json.dumps(rows, ensure_ascii=False)
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_hot_reason", result, date or "today")
+            _cache_set("get_a_hot_reason", result, date)
         return result
     except Exception as e:
         return fail(e)
@@ -827,14 +1151,16 @@ def get_a_north_flow_minute(save_snapshot: bool = False) -> str:
       {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"}}, required=['symbol'])
 def get_a_concept_blocks(symbol: str) -> str:
     import json as _json
-    cached = _cache_get("get_a_concept_blocks", symbol)
+    secid = eastmoney_secid(symbol)
+    if secid is None:
+        return symbol_fail(symbol)
+    cached = _cache_get("get_a_concept_blocks", secid)
     if cached:
         return cached
     try:
-        market_code = 1 if symbol.startswith("6") else 0
         params = {
             "fltt": "2", "invt": "2",
-            "secid": f"{market_code}.{symbol}",
+            "secid": secid,
             "spt": "3", "pi": "0", "pz": "200", "po": "1",
             "fields": "f12,f14,f3,f128",
         }
@@ -855,7 +1181,7 @@ def get_a_concept_blocks(symbol: str) -> str:
         result = _json.dumps({"total": len(boards), "boards": boards,
                               "concept_tags": [b["name"] for b in boards]}, ensure_ascii=False)
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_concept_blocks", result, symbol)
+            _cache_set("get_a_concept_blocks", result, secid)
         return result
     except Exception as e:
         return fail(e)
@@ -867,11 +1193,13 @@ def get_a_concept_blocks(symbol: str) -> str:
        "klt": {"type": "integer", "description": "Bar size: 1=minute, 5=5min, 101=daily (default 1)"}}, required=['symbol'])
 def get_a_fund_flow_minute(symbol: str, klt: int = 1) -> str:
     import json as _json
-    cached = _cache_get("get_a_fund_flow_minute", symbol, str(klt))
+    secid = eastmoney_secid(symbol)
+    if secid is None:
+        return symbol_fail(symbol)
+    cached = _cache_get("get_a_fund_flow_minute", secid, str(klt))
     if cached:
         return cached
     try:
-        secid = f"1.{symbol}" if symbol.startswith("6") else f"0.{symbol}"
         url = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
         params = {
             "secid": secid, "klt": klt,
@@ -896,7 +1224,7 @@ def get_a_fund_flow_minute(symbol: str, klt: int = 1) -> str:
                 })
         result = _json.dumps(rows, ensure_ascii=False)
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_fund_flow_minute", result, symbol, str(klt))
+            _cache_set("get_a_fund_flow_minute", result, secid, str(klt))
         return result
     except Exception as e:
         return fail(e)
@@ -909,7 +1237,13 @@ def get_a_fund_flow_minute(symbol: str, klt: int = 1) -> str:
 def get_a_dragon_tiger(symbol: str, trade_date: str, look_back: int = 30) -> str:
     import json as _json
     from datetime import datetime as _dt, timedelta as _td
-    cached = _cache_get("get_a_dragon_tiger", symbol, trade_date, str(look_back))
+    code = bare_code(symbol)
+    if code is None:
+        return symbol_fail(symbol)
+    trade_date, derr = date_arg(trade_date, "%Y-%m-%d", default_today=True)
+    if derr:
+        return derr
+    cached = _cache_get("get_a_dragon_tiger", code, trade_date, str(look_back))
     if cached:
         return cached
     try:
@@ -918,7 +1252,7 @@ def get_a_dragon_tiger(symbol: str, trade_date: str, look_back: int = 30) -> str
         records = []
         data = eastmoney_datacenter(
             "RPT_DAILYBILLBOARD_DETAILSNEW",
-            filter_str=f"(TRADE_DATE>='{start_str}')(TRADE_DATE<='{trade_date}')(SECURITY_CODE=\"{symbol}\")",
+            filter_str=f"(TRADE_DATE>='{start_str}')(TRADE_DATE<='{trade_date}')(SECURITY_CODE=\"{code}\")",
             page_size=50, sort_columns="TRADE_DATE", sort_types="-1",
         )
         for row in data:
@@ -934,7 +1268,7 @@ def get_a_dragon_tiger(symbol: str, trade_date: str, look_back: int = 30) -> str
             latest_date = records[0]["date"]
             buy_data = eastmoney_datacenter(
                 "RPT_BILLBOARD_DAILYDETAILSBUY",
-                filter_str=f"(TRADE_DATE='{latest_date}')(SECURITY_CODE=\"{symbol}\")",
+                filter_str=f"(TRADE_DATE='{latest_date}')(SECURITY_CODE=\"{code}\")",
                 page_size=10, sort_columns="BUY", sort_types="-1",
             )
             for row in buy_data[:5]:
@@ -946,7 +1280,7 @@ def get_a_dragon_tiger(symbol: str, trade_date: str, look_back: int = 30) -> str
                 })
             sell_data = eastmoney_datacenter(
                 "RPT_BILLBOARD_DAILYDETAILSSELL",
-                filter_str=f"(TRADE_DATE='{latest_date}')(SECURITY_CODE=\"{symbol}\")",
+                filter_str=f"(TRADE_DATE='{latest_date}')(SECURITY_CODE=\"{code}\")",
                 page_size=10, sort_columns="SELL", sort_types="-1",
             )
             for row in sell_data[:5]:
@@ -966,26 +1300,33 @@ def get_a_dragon_tiger(symbol: str, trade_date: str, look_back: int = 30) -> str
             institution["net_wan"] = round(institution["buy_wan"] - institution["sell_wan"], 1)
         result = _json.dumps({"records": records, "seats": seats, "institution": institution}, ensure_ascii=False)
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_dragon_tiger", result, symbol, trade_date, str(look_back))
+            _cache_set("get_a_dragon_tiger", result, code, trade_date, str(look_back))
         return result
     except Exception as e:
         return fail(e)
 
 
-@tool("get_a_lockup_expiry", "Get lockup expiry calendar (限售解禁): historical + upcoming 90 days.",
+@tool("get_a_lockup_expiry", "Get lockup expiry calendar (限售解禁): historical + upcoming 90 days. "
+      "trade_date accepts 2026-09-14 / 20260914 / 2026/09/14.",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '002475')"},
        "trade_date": {"type": "string", "description": "Trade date YYYY-MM-DD"},
        "forward_days": {"type": "integer", "description": "Days to look forward (default 90)"}}, required=['symbol', 'trade_date'])
 def get_a_lockup_expiry(symbol: str, trade_date: str, forward_days: int = 90) -> str:
     import json as _json
     from datetime import datetime as _dt, timedelta as _td
-    cached = _cache_get("get_a_lockup_expiry", symbol, trade_date, str(forward_days))
+    code = bare_code(symbol)
+    if code is None:
+        return symbol_fail(symbol)
+    trade_date, derr = date_arg(trade_date, "%Y-%m-%d", default_today=True)
+    if derr:
+        return derr
+    cached = _cache_get("get_a_lockup_expiry", code, trade_date, str(forward_days))
     if cached:
         return cached
     try:
         history_data = eastmoney_datacenter(
             "RPT_LIFT_STAGE",
-            filter_str=f'(SECURITY_CODE="{symbol}")',
+            filter_str=f'(SECURITY_CODE="{code}")',
             page_size=15, sort_columns="FREE_DATE", sort_types="-1",
         )
         history = []
@@ -1000,7 +1341,7 @@ def get_a_lockup_expiry(symbol: str, trade_date: str, forward_days: int = 90) ->
         end_str = end_date.strftime("%Y-%m-%d")
         upcoming_data = eastmoney_datacenter(
             "RPT_LIFT_STAGE",
-            filter_str=f'(SECURITY_CODE="{symbol}")(FREE_DATE>=\'{trade_date}\')(FREE_DATE<=\'{end_str}\')',
+            filter_str=f'(SECURITY_CODE="{code}")(FREE_DATE>=\'{trade_date}\')(FREE_DATE<=\'{end_str}\')',
             page_size=20, sort_columns="FREE_DATE", sort_types="1",
         )
         upcoming = []
@@ -1013,7 +1354,7 @@ def get_a_lockup_expiry(symbol: str, trade_date: str, forward_days: int = 90) ->
             })
         result = _json.dumps({"history": history, "upcoming": upcoming}, ensure_ascii=False)
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_lockup_expiry", result, symbol, trade_date, str(forward_days))
+            _cache_set("get_a_lockup_expiry", result, code, trade_date, str(forward_days))
         return result
     except Exception as e:
         return fail(e)
@@ -1062,14 +1403,17 @@ def get_a_industry_rank(top_n: int = 20) -> str:
 
 
 @tool("get_a_daily_dragon_tiger", "Get market-wide dragon tiger board for a day (全市场龙虎榜). "
-      "Returns all stocks hitting the board with net buy amounts.",
+      "Returns all stocks hitting the board with net buy amounts. "
+      "trade_date accepts 2026-09-14 / 20260914 / 2026/09/14 (default today). "
+      "Returns object: date, total_records, stocks[] with code, name, reason, close, "
+      "change_pct, net_buy_wan, buy_wan, sell_wan, turnover_pct.",
       {"trade_date": {"type": "string", "description": "Trade date YYYY-MM-DD (default today)"},
        "min_net_buy_wan": {"type": "number", "description": "Min net buy in 万CNY filter (optional)"}})
 def get_a_daily_dragon_tiger(trade_date: str = None, min_net_buy_wan: float = None) -> str:
     import json as _json
-    from datetime import datetime as _dt
-    if trade_date is None:
-        trade_date = _dt.now().strftime("%Y-%m-%d")
+    trade_date, derr = date_arg(trade_date, "%Y-%m-%d", default_today=True)
+    if derr:
+        return derr
     cached = _cache_get("get_a_daily_dragon_tiger", trade_date, str(min_net_buy_wan or ""))
     if cached:
         return cached
@@ -1115,13 +1459,16 @@ def get_a_daily_dragon_tiger(trade_date: str = None, min_net_buy_wan: float = No
        "page_size": {"type": "integer", "description": "Records to fetch (default 30)"}}, required=['symbol'])
 def get_a_margin(symbol: str, page_size: int = 30) -> str:
     import json as _json
-    cached = _cache_get("get_a_margin", symbol, str(page_size))
+    code = bare_code(symbol)
+    if code is None:
+        return symbol_fail(symbol)
+    cached = _cache_get("get_a_margin", code, str(page_size))
     if cached:
         return cached
     try:
         data = eastmoney_datacenter(
             "RPTA_WEB_RZRQ_GGMX",
-            filter_str=f'(SCODE="{symbol}")',
+            filter_str=f'(SCODE="{code}")',
             page_size=page_size, sort_columns="DATE", sort_types="-1",
         )
         rows = []
@@ -1149,13 +1496,16 @@ def get_a_margin(symbol: str, page_size: int = 30) -> str:
        "page_size": {"type": "integer", "description": "Records to fetch (default 20)"}}, required=['symbol'])
 def get_a_block_trade(symbol: str, page_size: int = 20) -> str:
     import json as _json
-    cached = _cache_get("get_a_block_trade", symbol, str(page_size))
+    code = bare_code(symbol)
+    if code is None:
+        return symbol_fail(symbol)
+    cached = _cache_get("get_a_block_trade", code, str(page_size))
     if cached:
         return cached
     try:
         data = eastmoney_datacenter(
             "RPT_DATA_BLOCKTRADE",
-            filter_str=f'(SECURITY_CODE="{symbol}")',
+            filter_str=f'(SECURITY_CODE="{code}")',
             page_size=page_size, sort_columns="TRADE_DATE", sort_types="-1",
         )
         rows = []
@@ -1185,13 +1535,16 @@ def get_a_block_trade(symbol: str, page_size: int = 20) -> str:
        "page_size": {"type": "integer", "description": "Records to fetch (default 10)"}}, required=['symbol'])
 def get_a_holder_num(symbol: str, page_size: int = 10) -> str:
     import json as _json
-    cached = _cache_get("get_a_holder_num", symbol, str(page_size))
+    code = bare_code(symbol)
+    if code is None:
+        return symbol_fail(symbol)
+    cached = _cache_get("get_a_holder_num", code, str(page_size))
     if cached:
         return cached
     try:
         data = eastmoney_datacenter(
             "RPT_HOLDERNUMLATEST",
-            filter_str=f'(SECURITY_CODE="{symbol}")',
+            filter_str=f'(SECURITY_CODE="{code}")',
             page_size=page_size, sort_columns="END_DATE", sort_types="-1",
         )
         rows = []
@@ -1205,7 +1558,7 @@ def get_a_holder_num(symbol: str, page_size: int = 10) -> str:
             })
         result = _json.dumps(rows, ensure_ascii=False)
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_holder_num", result, symbol, str(page_size))
+            _cache_set("get_a_holder_num", result, code, str(page_size))
         return result
     except Exception as e:
         return fail(e)
@@ -1216,13 +1569,16 @@ def get_a_holder_num(symbol: str, page_size: int = 10) -> str:
        "page_size": {"type": "integer", "description": "Records to fetch (default 20)"}}, required=['symbol'])
 def get_a_dividend(symbol: str, page_size: int = 20) -> str:
     import json as _json
-    cached = _cache_get("get_a_dividend", symbol, str(page_size))
+    code = bare_code(symbol)
+    if code is None:
+        return symbol_fail(symbol)
+    cached = _cache_get("get_a_dividend", code, str(page_size))
     if cached:
         return cached
     try:
         data = eastmoney_datacenter(
             "RPT_SHAREBONUS_DET",
-            filter_str=f'(SECURITY_CODE="{symbol}")',
+            filter_str=f'(SECURITY_CODE="{code}")',
             page_size=page_size, sort_columns="EX_DIVIDEND_DATE", sort_types="-1",
         )
         rows = []
@@ -1236,24 +1592,28 @@ def get_a_dividend(symbol: str, page_size: int = 20) -> str:
             })
         result = _json.dumps(rows, ensure_ascii=False)
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_dividend", result, symbol, str(page_size))
+            _cache_set("get_a_dividend", result, code, str(page_size))
         return result
     except Exception as e:
         return fail(e)
 
 
-@tool("get_a_fund_flow_120d", "Get daily fund flow for last 120 trading days: main/super/large/mid/small net. Unit: CNY.",
+@tool("get_a_fund_flow_120d", "Get daily fund flow for last 120 trading days: main/super/large/mid/small net. Unit: CNY. "
+      "Returns array(≤120 bars): date, main_net(主力,元), small_net(小单,元), mid_net(中单,元), "
+      "large_net(大单,元), super_net(超大单,元).",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"}}, required=['symbol'])
 def get_a_fund_flow_120d(symbol: str) -> str:
     import json as _json
-    cached = _cache_get("get_a_fund_flow_120d", symbol)
+    secid = eastmoney_secid(symbol)
+    if secid is None:
+        return symbol_fail(symbol)
+    cached = _cache_get("get_a_fund_flow_120d", secid)
     if cached:
         return cached
     try:
-        market_code = 1 if symbol.startswith("6") else 0
         url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
         params = {
-            "secid": f"{market_code}.{symbol}",
+            "secid": secid,
             "fields1": "f1,f2,f3,f7",
             "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
             "lmt": "120",
@@ -1277,7 +1637,7 @@ def get_a_fund_flow_120d(symbol: str) -> str:
                 })
         result = _json.dumps(rows, ensure_ascii=False)
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_fund_flow_120d", result, symbol)
+            _cache_set("get_a_fund_flow_120d", result, secid)
         return result
     except Exception as e:
         return fail(e)
@@ -1287,19 +1647,23 @@ def get_a_fund_flow_120d(symbol: str) -> str:
 # 38-39. News layer (新闻层)
 # ═══════════════════════════════════════════════
 
-@tool("get_a_news", "Get stock-specific news from Eastmoney (个股新闻). Returns title, content, time, source, URL.",
+@tool("get_a_news", "Get stock-specific news from Eastmoney (个股新闻). Returns title, content, time, source, URL. "
+      "Returns array: title, content(摘要≤200字), time, source(媒体), url.",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '688017')"},
        "page_size": {"type": "integer", "description": "Articles to fetch (default 20)"}}, required=['symbol'])
 def get_a_news(symbol: str, page_size: int = 20) -> str:
     import json as _json, re as _re
-    cached = _cache_get("get_a_news", symbol, str(page_size))
+    code = bare_code(symbol)
+    if code is None:
+        return symbol_fail(symbol)
+    cached = _cache_get("get_a_news", code, str(page_size))
     if cached:
         return cached
     try:
         cb = "jQuery_news"
         url = "https://search-api-web.eastmoney.com/search/jsonp"
         inner_params = _json.dumps({
-            "uid": "", "keyword": symbol,
+            "uid": "", "keyword": code,
             "type": ["cmsArticleWebOld"],
             "client": "web", "clientType": "web", "clientVersion": "curr",
             "param": {"cmsArticleWebOld": {"searchScope": "default", "sort": "default",
@@ -1323,7 +1687,7 @@ def get_a_news(symbol: str, page_size: int = 20) -> str:
             })
         result = _json.dumps(rows, ensure_ascii=False)
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_news", result, symbol, str(page_size))
+            _cache_set("get_a_news", result, code, str(page_size))
         return result
     except Exception as e:
         return fail(e)
@@ -1336,17 +1700,19 @@ def get_a_news(symbol: str, page_size: int = 20) -> str:
       {"symbol": {"type": "string", "description": "Stock code (e.g. '688017')"}}, required=['symbol'])
 def get_a_mootdx_finance(symbol: str) -> str:
     import json as _json
-    cached = _cache_get("get_a_mootdx_finance", symbol)
+    code = bare_code(symbol)
+    if code is None:
+        return symbol_fail(symbol)
+    cached = _cache_get("get_a_mootdx_finance", code)
     if cached:
         return cached
     try:
         client = tdx_client()
-        market = 1 if symbol.startswith("6") else 0
-        fin = client.finance(symbol=symbol)
+        fin = client.finance(symbol=code)
         # Convert to serializable dict
         result = _json.dumps(dict(fin) if hasattr(fin, 'items') else str(fin), ensure_ascii=False)
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_mootdx_finance", result, symbol)
+            _cache_set("get_a_mootdx_finance", result, code)
         return result
     except Exception as e:
         return fail(e)
@@ -1357,34 +1723,41 @@ def get_a_mootdx_finance(symbol: str) -> str:
        "category": {"type": "string", "description": "Category: 最新提示/公司概况/财务分析/股东研究/股本结构/资本运作/业内点评/行业分析/公司大事 (default 最新提示)"}}, required=['symbol'])
 def get_a_mootdx_f10(symbol: str, category: str = "最新提示") -> str:
     import json as _json
-    cached = _cache_get("get_a_mootdx_f10", symbol, category)
+    code = bare_code(symbol)
+    if code is None:
+        return symbol_fail(symbol)
+    cached = _cache_get("get_a_mootdx_f10", code, category)
     if cached:
         return cached
     try:
         client = tdx_client()
-        text = client.F10(symbol=symbol, name=category)
+        text = client.F10(symbol=code, name=category)
         result = _json.dumps({"category": category, "content": text or ""}, ensure_ascii=False)
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_mootdx_f10", result, symbol, category)
+            _cache_set("get_a_mootdx_f10", result, code, category)
         return result
     except Exception as e:
         return fail(e)
 
 
-@tool("get_a_stock_info", "Get A-share basic info: industry, total/float shares, market cap, list date (Eastmoney push2).",
+@tool("get_a_stock_info", "Get A-share basic info: industry, total/float shares, market cap, list date (Eastmoney push2). "
+      "Returns object: code, name, industry, total_shares(股), float_shares(股), "
+      "mcap(元), float_mcap(元), list_date(YYYYMMDD), price.",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '688017')"}}, required=['symbol'])
 def get_a_stock_info(symbol: str) -> str:
     import json as _json
-    cached = _cache_get("get_a_stock_info", symbol)
+    secid = eastmoney_secid(symbol)
+    if secid is None:
+        return symbol_fail(symbol)
+    cached = _cache_get("get_a_stock_info", secid)
     if cached:
         return cached
     try:
-        market_code = 1 if symbol.startswith("6") else 0
         url = "https://push2.eastmoney.com/api/qt/stock/get"
         params = {
             "fltt": "2", "invt": "2",
             "fields": "f57,f58,f84,f85,f127,f116,f117,f189,f43",
-            "secid": f"{market_code}.{symbol}",
+            "secid": secid,
         }
         headers = {"User-Agent": _UA}
         r = em_get(url, params=params, headers=headers, timeout=10)
@@ -1401,7 +1774,7 @@ def get_a_stock_info(symbol: str) -> str:
         }
         result = _json.dumps(info, ensure_ascii=False)
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_stock_info", result, symbol)
+            _cache_set("get_a_stock_info", result, secid)
         return result
     except Exception as e:
         return fail(e)
@@ -1413,12 +1786,16 @@ def get_a_stock_info(symbol: str) -> str:
        "num": {"type": "integer", "description": "Number of periods (default 8)"}}, required=['symbol'])
 def get_a_financial_statements(symbol: str, report_type: str = "lrb", num: int = 8) -> str:
     import json as _json
-    cached = _cache_get("get_a_financial_statements", symbol, report_type, str(num))
+    norm = normalize_symbol(symbol)
+    if norm is None:
+        return symbol_fail(symbol)
+    market, code = norm
+    cached = _cache_get("get_a_financial_statements", market + code, report_type, str(num))
     if cached:
         return cached
     try:
-        prefix = "sh" if symbol.startswith("6") else "sz"
-        paper_code = f"{prefix}{symbol}"
+        prefix = market  # 新浪只认 sh/sz（北交所无此源，会返回空）
+        paper_code = f"{prefix}{code}"
         url = "https://quotes.sina.cn/cn/api/openapi.php/CompanyFinanceService.getFinanceReport2022"
         params = {
             "paperCode": paper_code, "source": report_type,
@@ -1442,7 +1819,7 @@ def get_a_financial_statements(symbol: str, report_type: str = "lrb", num: int =
             rows.append(rec)
         result = _json.dumps(rows, ensure_ascii=False)
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_financial_statements", result, symbol, report_type, str(num))
+            _cache_set("get_a_financial_statements", result, market + code, report_type, str(num))
         return result
     except Exception as e:
         return fail(e)
@@ -1454,7 +1831,7 @@ def get_a_financial_statements(symbol: str, report_type: str = "lrb", num: int =
 
 _CNINFO_ORGID_MAP = {}
 
-def _cninfo_orgid(code: str) -> str:
+def _cninfo_orgid(code: str, market: str = None) -> str:
     global _CNINFO_ORGID_MAP
     if not _CNINFO_ORGID_MAP:
         try:
@@ -1467,9 +1844,11 @@ def _cninfo_orgid(code: str) -> str:
     org = _CNINFO_ORGID_MAP.get(code)
     if org:
         return org
-    if code.startswith("6"):
+    if market is None:
+        market = (normalize_symbol(code) or ("sz", code))[0]
+    if market == "sh":
         return f"gssh0{code}"
-    elif code.startswith("8") or code.startswith("4"):
+    if market == "bj":
         return f"gsbj0{code}"
     return f"gssz0{code}"
 
@@ -1480,14 +1859,18 @@ def _cninfo_orgid(code: str) -> str:
 def get_a_announcements(symbol: str, page_size: int = 30) -> str:
     import json as _json
     from datetime import datetime as _dt
-    cached = _cache_get("get_a_announcements", symbol, str(page_size))
+    norm = normalize_symbol(symbol)
+    if norm is None:
+        return symbol_fail(symbol)
+    market, code = norm
+    cached = _cache_get("get_a_announcements", code, str(page_size))
     if cached:
         return cached
     try:
         url = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
-        org_id = _cninfo_orgid(symbol)
+        org_id = _cninfo_orgid(code, market)
         payload = {
-            "stock": f"{symbol},{org_id}",
+            "stock": f"{code},{org_id}",
             "tabName": "fulltext", "pageSize": str(page_size), "pageNum": "1",
             "column": "", "category": "", "plate": "", "seDate": "",
             "searchkey": "", "secid": "", "sortName": "", "sortType": "",
@@ -1516,7 +1899,7 @@ def get_a_announcements(symbol: str, page_size: int = 30) -> str:
             })
         result = _json.dumps(rows, ensure_ascii=False)
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_announcements", result, symbol, str(page_size))
+            _cache_set("get_a_announcements", result, code, str(page_size))
         return result
     except Exception as e:
         return fail(e)
@@ -1533,7 +1916,11 @@ def _fmt_zt_time(t) -> str:
     return f"{s[0:2]}:{s[2:4]}:{s[4:6]}"
 
 def _em_zt_api(endpoint: str, sort: str, date: str) -> list:
-    date = str(date).replace("-", "")  # 东财 push2ex 要 YYYYMMDD；调用方(如 SentimentAnalyst)传 YYYY-MM-DD 需归一化，否则 data:null
+    # 东财 push2ex 只认 YYYYMMDD；调用方可能传 2026-09-11 / 2026/09/11，统一归一化
+    try:
+        date = normalize_date(date, "%Y%m%d") or str(date).replace("-", "")
+    except ValueError:
+        date = str(date).replace("-", "")
     url = f"https://push2ex.eastmoney.com/{endpoint}"
     params = {"ut": _ZTB_UT, "dpt": "wz.ztzt", "Pageindex": 0,
               "pagesize": 10000, "sort": sort, "date": date}
@@ -1545,10 +1932,16 @@ def _em_zt_api(endpoint: str, sort: str, date: str) -> list:
         return []
 
 
-@tool("get_a_limit_up_pool", "Get today's limit-up pool (涨停池): name, code, price, pct, limit_days, seal time, seal fund, break_times, industry.",
-      {"date": {"type": "string", "description": "Trade date YYYYMMDD (e.g. '20260626')"}}, required=['date'])
-def get_a_limit_up_pool(date: str) -> str:
+@tool("get_a_limit_up_pool", "Get today's limit-up pool (涨停池): name, code, price, pct, limit_days, seal time, seal fund, break_times, industry. "
+      "date accepts 20260911 / 2026-09-11 / 2026/09/11 (default today). "
+      "Returns array: code, name, price, pct, amount, float_cap, turnover, limit_days, "
+      "first_seal, last_seal, seal_fund, break_times, industry, zt_stat.",
+      {"date": {"type": "string", "description": "Trade date YYYYMMDD or YYYY-MM-DD (default today)"}})
+def get_a_limit_up_pool(date: str = None) -> str:
     import json as _json
+    date, derr = date_arg(date, "%Y%m%d", default_today=True)
+    if derr:
+        return derr
     cached = _cache_get("get_a_limit_up_pool", date)
     if cached:
         return cached
@@ -1574,10 +1967,16 @@ def get_a_limit_up_pool(date: str) -> str:
         return fail(e)
 
 
-@tool("get_a_broken_board", "Get today's broken board pool (炸板池): stocks that hit limit-up then opened.",
-      {"date": {"type": "string", "description": "Trade date YYYYMMDD (e.g. '20260626')"}}, required=['date'])
-def get_a_broken_board(date: str) -> str:
+@tool("get_a_broken_board", "Get today's broken board pool (炸板池): stocks that hit limit-up then opened. "
+      "date accepts 20260911 / 2026-09-11 / 2026/09/11 (default today). "
+      "Returns array: code, name, price, limit_price, pct, turnover, first_seal, break_times, "
+      "amplitude, speed, industry, zt_stat.",
+      {"date": {"type": "string", "description": "Trade date YYYYMMDD or YYYY-MM-DD (default today)"}})
+def get_a_broken_board(date: str = None) -> str:
     import json as _json
+    date, derr = date_arg(date, "%Y%m%d", default_today=True)
+    if derr:
+        return derr
     cached = _cache_get("get_a_broken_board", date)
     if cached:
         return cached
@@ -1601,10 +2000,16 @@ def get_a_broken_board(date: str) -> str:
         return fail(e)
 
 
-@tool("get_a_limit_down_pool", "Get today's limit-down pool (跌停池).",
-      {"date": {"type": "string", "description": "Trade date YYYYMMDD (e.g. '20260626')"}}, required=['date'])
-def get_a_limit_down_pool(date: str) -> str:
+@tool("get_a_limit_down_pool", "Get today's limit-down pool (跌停池). "
+      "date accepts 20260911 / 2026-09-11 / 2026/09/11 (default today). "
+      "Returns array: code, name, price, pct, turnover, pe, seal_fund, last_seal, "
+      "board_amount, dt_days, open_times, industry.",
+      {"date": {"type": "string", "description": "Trade date YYYYMMDD or YYYY-MM-DD (default today)"}})
+def get_a_limit_down_pool(date: str = None) -> str:
     import json as _json
+    date, derr = date_arg(date, "%Y%m%d", default_today=True)
+    if derr:
+        return derr
     cached = _cache_get("get_a_limit_down_pool", date)
     if cached:
         return cached
@@ -1627,10 +2032,16 @@ def get_a_limit_down_pool(date: str) -> str:
         return fail(e)
 
 
-@tool("get_a_yesterday_zt", "Get yesterday's limit-up performance today (昨涨停今表现). Used to calculate promotion rate.",
-      {"date": {"type": "string", "description": "Trade date YYYYMMDD (e.g. '20260626')"}}, required=['date'])
-def get_a_yesterday_zt(date: str) -> str:
+@tool("get_a_yesterday_zt", "Get yesterday's limit-up performance today (昨涨停今表现). Used to calculate promotion rate. "
+      "date accepts 20260911 / 2026-09-11 / 2026/09/11 (default today). "
+      "Returns array: code, name, price, pct, turnover, amplitude, speed, y_first_seal, "
+      "y_limit_days, industry, zt_stat.",
+      {"date": {"type": "string", "description": "Trade date YYYYMMDD or YYYY-MM-DD (default today)"}})
+def get_a_yesterday_zt(date: str = None) -> str:
     import json as _json
+    date, derr = date_arg(date, "%Y%m%d", default_today=True)
+    if derr:
+        return derr
     cached = _cache_get("get_a_yesterday_zt", date)
     if cached:
         return cached
@@ -1653,11 +2064,17 @@ def get_a_yesterday_zt(date: str) -> str:
         return fail(e)
 
 
-@tool("get_a_zt_reason", "Get limit-up reason/themes from THS (同花顺涨停揭秘): reason tags, board type, seal rate.",
-      {"date": {"type": "string", "description": "Trade date YYYYMMDD (e.g. '20260626')"}}, required=['date'])
-def get_a_zt_reason(date: str) -> str:
+@tool("get_a_zt_reason", "Get limit-up reason/themes from THS (同花顺涨停揭秘): reason tags, board type, seal rate. "
+      "date accepts 20260911 / 2026-09-11 / 2026/09/11 (default today). "
+      "Returns array: code, name, price, pct, reason(题材), board_type, seal_rate, "
+      "break_times, seal_amount, high_days, first_time, is_again.",
+      {"date": {"type": "string", "description": "Trade date YYYYMMDD or YYYY-MM-DD (default today)"}})
+def get_a_zt_reason(date: str = None) -> str:
     import json as _json
     from datetime import datetime as _dt
+    date, derr = date_arg(date, "%Y%m%d", default_today=True)
+    if derr:
+        return derr
     cached = _cache_get("get_a_zt_reason", date)
     if cached:
         return cached
@@ -1694,10 +2111,16 @@ def get_a_zt_reason(date: str) -> str:
 
 
 @tool("get_a_board_emotion", "Calculate limit-up sentiment: break_rate, max_height, ladder (连板梯队), ZT/DT counts. "
-      "Break rate >40% = bearish, <20% = bullish.",
-      {"date": {"type": "string", "description": "Trade date YYYYMMDD (e.g. '20260626')"}}, required=['date'])
-def get_a_board_emotion(date: str) -> str:
+      "Break rate >40% = bearish, <20% = bullish. "
+      "date accepts 20260911 / 2026-09-11 / 2026/09/11 (default today). "
+      "Returns object: date, zt_count, zb_count, dt_count, break_rate(%), max_height, "
+      "ladder({连板数: 家数}).",
+      {"date": {"type": "string", "description": "Trade date YYYYMMDD or YYYY-MM-DD (default today)"}})
+def get_a_board_emotion(date: str = None) -> str:
     import json as _json
+    date, derr = date_arg(date, "%Y%m%d", default_today=True)
+    if derr:
+        return derr
     cached = _cache_get("get_a_board_emotion", date)
     if cached:
         return cached
@@ -1840,17 +2263,20 @@ def get_a_option_greeks(code: str) -> str:
 def get_a_irm_qa(symbol: str, page_size: int = 30) -> str:
     import json as _json
     from datetime import datetime as _dt
-    cached = _cache_get("get_a_irm_qa", symbol, str(page_size))
+    code = bare_code(symbol)
+    if code is None:
+        return symbol_fail(symbol)
+    cached = _cache_get("get_a_irm_qa", code, str(page_size))
     if cached:
         return cached
     try:
         r1 = _get_requests().post("https://irm.cninfo.com.cn/newircs/index/queryKeyboardInfo",
-            data={"keyWord": symbol}, headers={"User-Agent": _UA}, timeout=10)
+            data={"keyWord": code}, headers={"User-Agent": _UA}, timeout=10)
         d1 = r1.json().get("data") or []
         if not d1:
             return "[]"
         org_id = d1[0].get("secid")
-        params = {"_t": 1, "stockcode": symbol, "orgId": org_id,
+        params = {"_t": 1, "stockcode": code, "orgId": org_id,
                   "pageSize": page_size, "pageNum": 1,
                   "keyWord": "", "startDay": "", "endDay": ""}
         r2 = _get_requests().post("https://irm.cninfo.com.cn/newircs/company/question",
@@ -1869,7 +2295,7 @@ def get_a_irm_qa(symbol: str, page_size: int = 30) -> str:
             })
         result = _json.dumps(out, ensure_ascii=False)
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_irm_qa", result, symbol, str(page_size))
+            _cache_set("get_a_irm_qa", result, code, str(page_size))
         return result
     except Exception as e:
         return fail(e)
@@ -1950,20 +2376,24 @@ def get_a_em_hot_rank(top: int = 50) -> str:
       {"symbol": {"type": "string", "description": "Stock code (e.g. '601127')"}}, required=['symbol'])
 def get_a_hot_concept(symbol: str) -> str:
     import json as _json
-    cached = _cache_get("get_a_hot_concept", symbol)
+    norm = normalize_symbol(symbol)
+    if norm is None:
+        return symbol_fail(symbol)
+    market, code = norm
+    cached = _cache_get("get_a_hot_concept", market + code)
     if cached:
         return cached
     try:
-        prefix = "SH" if symbol.startswith("6") else "SZ"
+        prefix = market.upper()
         r = em_get("https://emappdata.eastmoney.com/stockrank/getHotStockRankList",
-            json={**_EM_HOT_BODY, "srcSecurityCode": prefix + symbol},
+            json={**_EM_HOT_BODY, "srcSecurityCode": prefix + code},
             headers={"User-Agent": _UA}, timeout=10, method="POST")
         data = r.json().get("data") or []
         out = [{"concept": x.get("conceptName"), "bk": x.get("conceptId"),
                 "hit": x.get("hitCount")} for x in data]
         result = _json.dumps(out, ensure_ascii=False)
         if not _is_empty_result(result):  # 空结果不缓存
-            _cache_set("get_a_hot_concept", result, symbol)
+            _cache_set("get_a_hot_concept", result, market + code)
         return result
     except Exception as e:
         return fail(e)
@@ -2054,6 +2484,13 @@ class DataHandler(BaseHTTPRequestHandler):
                 if tool_name not in HANDLERS:
                     self._json(404, {"error": f"unknown tool: {tool_name}"})
                     return
+                # 轻量类型强制：days="5" / symbol=600519 这类写法先转换，
+                # 转不了就返回指明参数名与期望类型的错误（不再抛 '>' not supported）
+                tool_args, arg_err = coerce_tool_args(tool_name, tool_args)
+                if arg_err:
+                    METRICS.inc_call(tool_name, "error")
+                    self._json(200, {"result": arg_err})
+                    return
                 t0 = time.time()
                 try:
                     result = HANDLERS[tool_name](**tool_args)
@@ -2129,6 +2566,13 @@ class DataHandler(BaseHTTPRequestHandler):
                     self._json(200, {"jsonrpc": "2.0", "id": mid,
                                      "error": {"code": -32029, "message": str(e)}})
                     return
+            # 轻量类型强制（同 /call-tool）：字符串数字、数字代码先转成声明的类型
+            tool_args, arg_err = coerce_tool_args(tool_name, tool_args)
+            if arg_err:
+                METRICS.inc_call(tool_name, "error")
+                self._json(200, {"jsonrpc": "2.0", "id": mid, "result": {
+                    "content": [{"type": "text", "text": arg_err}], "isError": True}})
+                return
             t0 = time.time()
             try:
                 result = HANDLERS[tool_name](**tool_args)
