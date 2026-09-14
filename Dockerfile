@@ -10,12 +10,16 @@ ARG PIP_INDEX_URL
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DEFAULT_TIMEOUT=30 \
+    PIP_RETRIES=5
 
 WORKDIR /app
 
 COPY requirements.txt ./
-RUN pip install -r requirements.txt
+# --timeout/--retries：镜像站偶发"连上但不回数据"，pip 默认无超时会永久 poll 在
+# 一个 socket 上（factor-miner 曾连续卡 54 分钟、构建缓存冻住；本服务也实测卡过 5 分钟）
+RUN pip install --timeout 30 --retries 5 -r requirements.txt
 
 COPY . .
 
