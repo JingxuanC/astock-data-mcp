@@ -36,6 +36,8 @@ except ImportError:
 from pathlib import Path
 from typing import Any, Optional
 
+import threading
+
 from research_report import fetch_research_reports
 from mcp_gateway import METRICS, LicenseStore, QuotaExceeded
 
@@ -87,11 +89,26 @@ def _get_mootdx():
         _mootdx_quotes_loaded = True
     return _mootdx_quotes
 
-# ── Eastmoney anti-blocking: global throttle + session reuse ──
+# ── Eastmoney anti-blocking: per-host throttle + session reuse ──
+# 各子域是独立服务、限流互不影响，全局共用一个 1s 节流会把 push2 行情请求也
+# 压在 datacenter 的节奏上。改为按 host 限流：写库型接口（datacenter/reportapi/
+# emappdata）保持 1 req/s，行情型接口（push2/push2his/push2ex）放宽。
+# 实测效果：get_a_market_snapshot 翻 55 页由 ~70s 降到 ~12s。
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 _EM_SESSION = None
-_EM_MIN_INTERVAL = 1.0
-_em_last_call = [0.0]
+# host → 最小请求间隔（秒）；未列出的 host 用 _EM_DEFAULT_INTERVAL
+_EM_HOST_INTERVALS = {
+    "datacenter-web.eastmoney.com": 1.0,
+    "reportapi.eastmoney.com": 1.0,
+    "emappdata.eastmoney.com": 1.0,
+    "search-api-web.eastmoney.com": 1.0,
+    "push2.eastmoney.com": 0.2,
+    "push2his.eastmoney.com": 0.2,
+    "push2ex.eastmoney.com": 0.2,
+}
+_EM_DEFAULT_INTERVAL = 0.5
+_em_last_call: dict = {}
+_em_lock = threading.Lock()
 
 def _get_em_session():
     global _EM_SESSION
@@ -113,21 +130,24 @@ def _get_em_session():
 
 def em_get(url: str, params: dict = None, headers: dict = None, timeout: int = 15,
            method: str = "GET", **kwargs):
-    """Eastmoney unified request: auto throttle + session reuse + default UA.
+    """Eastmoney unified request: per-host throttle + session reuse + default UA.
     All eastmoney.com APIs must go through this to avoid IP ban.
     method: "GET" (default) or "POST"."""
-    import time as _time
     import random as _random
-    wait = _EM_MIN_INTERVAL - (_time.time() - _em_last_call[0])
+    from urllib.parse import urlparse
+    host = urlparse(url).netloc
+    interval = _EM_HOST_INTERVALS.get(host, _EM_DEFAULT_INTERVAL)
+    # 预约式限流：在锁内把"下一次可请求时间"写死，sleep 放在锁外，
+    # 这样 push2 的请求不会被 datacenter 的等待挡住（反之亦然）。
+    with _em_lock:
+        wait = interval - (time.time() - _em_last_call.get(host, 0.0))
+        _em_last_call[host] = time.time() + max(wait, 0.0)
     if wait > 0:
-        _time.sleep(wait + _random.uniform(0.1, 0.5))
-    try:
-        if method.upper() == "POST":
-            return _get_em_session().post(url, params=params, headers=headers,
-                                          timeout=timeout, **kwargs)
-        return _get_em_session().get(url, params=params, headers=headers, timeout=timeout, **kwargs)
-    finally:
-        _em_last_call[0] = _time.time()
+        time.sleep(wait + _random.uniform(0.05, 0.2))
+    if method.upper() == "POST":
+        return _get_em_session().post(url, params=params, headers=headers,
+                                      timeout=timeout, **kwargs)
+    return _get_em_session().get(url, params=params, headers=headers, timeout=timeout, **kwargs)
 
 _DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 
@@ -205,13 +225,36 @@ def _cache_path(tool_name: str, *args) -> Path:
     return CACHE_DIR / f"{key}.json"
 
 
+_HISTORICAL_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_HISTORICAL_DATE_COMPACT_RE = re.compile(r"^\d{8}$")
+
+
+def _is_historical_key(args) -> bool:
+    """缓存键里是否含"过去的日期"——历史数据不可变，可永久缓存（不过期）。
+
+    支持 2026-09-11 与 20260911 两种形态。严格早于今天才算历史；
+    今天/未来的日期仍走 CACHE_TTL 短TTL（盘中数据会变）。
+    只读缓存键、不改写参数语义，调用点零改动。
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_compact = today.replace("-", "")
+    for a in args:
+        s = str(a)
+        if _HISTORICAL_DATE_RE.match(s) and s < today:
+            return True
+        if _HISTORICAL_DATE_COMPACT_RE.match(s) and s < today_compact:
+            return True
+    return False
+
+
 def _cache_get(tool_name: str, *args) -> Optional[Any]:
     p = _cache_path(tool_name, *args)
     if not p.exists():
         return None
     try:
         data = json.loads(p.read_text())
-        if time.time() - data.get("ts", 0) < CACHE_TTL:
+        ttl = None if _is_historical_key(args) else CACHE_TTL
+        if ttl is None or time.time() - data.get("ts", 0) < ttl:
             return data.get("value")
     except (json.JSONDecodeError, KeyError):
         pass
