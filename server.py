@@ -1267,7 +1267,7 @@ def get_a_block_trade(symbol: str, page_size: int = 20) -> str:
         return fail(e)
 
 
-@tool("get_a_holder_num", "Get shareholder count changes (股东户数变化). Fewer holders = concentration = accumulation signal.",
+@tool("get_a_holder_num", "Get shareholder count changes (股东户数变化). Fewer holders indicates a higher concentration of holdings. Returns raw counts and change rates only — it does not interpret what a change implies for the price.",
       {"symbol": {"type": "string", "description": "Stock code (e.g. '600519')"},
        "page_size": {"type": "integer", "description": "Records to fetch (default 10)"}}, required=['symbol'])
 def get_a_holder_num(symbol: str, page_size: int = 10) -> str:
@@ -1847,8 +1847,8 @@ def get_a_zt_reason(date: str = None) -> str:
         return fail(e)
 
 
-@tool("get_a_board_emotion", "Calculate limit-up sentiment: break_rate, max_height, ladder (连板梯队), ZT/DT counts. "
-      "Break rate >40% = bearish, <20% = bullish. "
+@tool("get_a_board_emotion", "Calculate limit-up statistics: break_rate, max_height, ladder (连板梯队), ZT/DT counts. "
+      "Returns the metrics as measured; it does not label the market as bullish or bearish. "
       "date accepts 20260911 / 2026-09-11 / 2026/09/11 (default today). "
       "Returns object: date, zt_count, zb_count, dt_count, break_rate(%), max_height, "
       "ladder({连板数: 家数}).",
