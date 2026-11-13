@@ -1447,7 +1447,17 @@ def get_a_mootdx_finance(symbol: str) -> str:
         client = tdx_client()
         fin = client.finance(symbol=code)
         # Convert to serializable dict
-        result = _json.dumps(dict(fin) if hasattr(fin, 'items') else str(fin), ensure_ascii=False)
+        # LOCAL PATCH (2026-10-17, dsh-mcp setup): mootdx>=0.11.7 returns a 1-row
+        # pandas DataFrame here; dict(df) yields {col: Series} which is not JSON
+        # serializable. Use records when available, else fall back to dict()/str().
+        if hasattr(fin, "to_dict") and hasattr(fin, "columns"):
+            _recs = fin.to_dict("records")
+            payload = _recs[0] if _recs else {}
+        elif hasattr(fin, "items"):
+            payload = dict(fin)
+        else:
+            payload = str(fin)
+        result = _json.dumps(payload, ensure_ascii=False, default=str)
         if not _is_empty_result(result):  # 空结果不缓存
             _cache_set("get_a_mootdx_finance", result, code)
         return result
